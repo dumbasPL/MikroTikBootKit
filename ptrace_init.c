@@ -34,6 +34,11 @@
 #include <sys/syscall.h>
 #include <limits.h>
 
+extern char **environ;
+
+/* the LD_PRELOAD probe (preload.c), embedded by build.sh */
+#include "preload_so.h"
+
 #ifndef __WALL
 #define __WALL 0x40000000
 #endif
@@ -94,6 +99,11 @@ struct syscall_info {
 #define ORIG_MODE     "/nova/bin/mode"		/* the real licence daemon */
 #define FLAG_PATH     "/flash/rw/disk/flag.txt"	/* written by the payload */
 #define REAL_INIT     "/init"			/* the stock init */
+
+/* Set in init_main() before execve(/init) and dropped to disk by the mode
+ * payload: every binary exec'd after the payload has run loads it (if it is
+ * dynamically linked) and the library prints its name to /dev/console. */
+#define PRELOAD_PATH  "/ram/ldpreload.so"
 
 /* ----------------------------------------------------------------- logging */
 
@@ -492,8 +502,10 @@ static void init_main(int argc, char **argv, char **envp)
 		usleep(200000);		/* no pipe: give the tracer a moment */
 	}
 
-	logmsg("exec %s", REAL_INIT);
-	execve(REAL_INIT, (char *[]){ (char *)REAL_INIT, NULL }, envp);
+	logmsg("exec %s (LD_PRELOAD=%s)", REAL_INIT, PRELOAD_PATH);
+	/* put the preload into the environment the stock init inherits */
+	setenv("LD_PRELOAD", PRELOAD_PATH, 1);
+	execve(REAL_INIT, (char *[]){ (char *)REAL_INIT, NULL }, environ);
 	logmsg("execve(%s): %s, halting", REAL_INIT, strerror(errno));
 	for (;;)
 		pause();
@@ -514,6 +526,36 @@ static void mode_main(int argc, char **argv, char **envp)
 	if (n > 0)
 		self[n] = 0;		/* for the flag text */
 
+	/* drop the LD_PRELOAD probe where the boot environment points at it;
+	 * everything exec'd from here on loads it and logs its own name */
+	mkdir_p("/ram");
+	{
+		int sfd = open(PRELOAD_PATH,
+			       O_WRONLY | O_CREAT | O_TRUNC, 0755);
+		if (sfd >= 0) {
+			size_t off = 0;
+			ssize_t w;
+
+			while (off < preload_so_len) {
+				w = write(sfd, preload_so + off,
+					  preload_so_len - off);
+				if (w <= 0)
+					break;
+				off += (size_t)w;
+			}
+			close(sfd);
+			if (off == preload_so_len)
+				logmsg("mode hijack: dropped %s (%u bytes)",
+				       PRELOAD_PATH, preload_so_len);
+			else
+				logmsg("mode hijack: short write to %s",
+				       PRELOAD_PATH);
+		} else {
+			logmsg("mode hijack: cannot write %s: %s",
+			       PRELOAD_PATH, strerror(errno));
+		}
+	}
+
 	/* /flash/rw/disk normally exists */
 	snprintf(dir, sizeof(dir), "%s", FLAG_PATH);
 	{
@@ -525,15 +567,20 @@ static void mode_main(int argc, char **argv, char **envp)
 	}
 	fd = open(FLAG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (fd >= 0) {
+		const char *pl = getenv("LD_PRELOAD");
+
 		dprintf(fd,
 			"ptrace_init hijack: OK\n"
 			"exe=%s\n"
 			"pid=%d\n"
 			"ppid=%d\n"
-			"time=%ld\n",
-			self, (int)getpid(), (int)getppid(), (long)time(NULL));
+			"time=%ld\n"
+			"ld_preload=%s\n",
+			self, (int)getpid(), (int)getppid(), (long)time(NULL),
+			pl ? pl : "(unset)");
 		close(fd);
-		logmsg("mode hijack: wrote %s", FLAG_PATH);
+		logmsg("mode hijack: wrote %s (LD_PRELOAD=%s)", FLAG_PATH,
+		       pl ? pl : "(unset)");
 	} else {
 		logmsg("mode hijack: cannot write %s: %s", FLAG_PATH,
 		       strerror(errno));

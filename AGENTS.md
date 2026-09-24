@@ -16,15 +16,20 @@ Design notes, the target behaviours it relies on and the observed boot log:
 
 ```
 ptrace_init.c               the tool (static i386)
-build.sh                    build script
+preload.c                   LD_PRELOAD probe (normal C, imports resolved by the ldso)
+build.sh                    builds + embeds the probe, then the tool
 docs/ptrace-init-hijack.md  design + findings + verified log
 ```
 
 ## Build
 
 ```sh
-./build.sh                  # -> ./ptrace_init (~51 KB static i386)
+./build.sh                  # -> ./ptrace_init (static i386, ~76 KB with the probe)
 ```
+
+The LD_PRELOAD probe (preload.c) is ordinary C linked without libc
+(-nostdlib): no DT_NEEDED entry, the imports are bound at load time by the
+dynamic linker against the libc already in the process (RouterOS /lib/libc.so).
 
 It uses, in order: a local `.toolchain/i386-musl`, MikroTikPatch's
 `.toolchain/i386-musl` (create it with `MikroTikPatch/tools/musl_i386.sh`), or

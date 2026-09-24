@@ -1,6 +1,7 @@
 #!/bin/sh
 # Build ptrace_init: a small static i386 binary used as an alternative
-# initramfs init that hijacks the RouterOS "mode" exec via ptrace.
+# initramfs init that drops an LD_PRELOAD probe into /ram once the stock init
+# has mounted the tmpfs there (via ptrace, see ptrace_init.c).
 #
 # Usage: ./build.sh [output]          (default: ./ptrace_init)
 #

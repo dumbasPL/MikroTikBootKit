@@ -3,14 +3,16 @@
 Boot-time tooling for MikroTik RouterOS images.  Currently one tool:
 
 * **`ptrace_init.c`** — an alternative initramfs init (`rdinit=/ptrace_init`)
-  that ptrace-attaches to the real init, follows the fork that execs
-  `/sbin/sysinit`, and redirects the `execve` of `/nova/bin/mode` to
-  `/proc/<tracer-pid>/exe` (itself).  The resulting "mode" process writes
-  `/flash/rw/disk/flag.txt` and then execs the real licence daemon.  Nothing
-  in the RouterOS image is modified.
+  that ptrace-attaches to the real init and waits for it to mount the tmpfs on
+  `/ram`.  As soon as the mount succeeds the tracer writes an embedded
+  `LD_PRELOAD` probe to `/ram/ldpreload.so`, detaches the init and exits.
+  The probe is put into the environment before `/init` is exec'd, so every
+  dynamically linked binary started after the mount (`sysinit`, `mode`,
+  `loader`, all services) loads it and its constructor logs the binary's name
+  to `/dev/console`.  Nothing in the RouterOS image is modified.
 
 Design notes, the target behaviours it relies on and the observed boot log:
-`docs/ptrace-init-hijack.md`.
+`docs/ptrace-init-preload.md`.
 
 ## Layout
 
@@ -18,13 +20,13 @@ Design notes, the target behaviours it relies on and the observed boot log:
 ptrace_init.c               the tool (static i386)
 preload.c                   LD_PRELOAD probe (normal C, imports resolved by the ldso)
 build.sh                    builds + embeds the probe, then the tool
-docs/ptrace-init-hijack.md  design + findings + verified log
+docs/ptrace-init-preload.md design + findings + verified log
 ```
 
 ## Build
 
 ```sh
-./build.sh                  # -> ./ptrace_init (static i386, ~76 KB with the probe)
+./build.sh                  # -> ./ptrace_init (static i386, ~73 KB with the probe)
 ```
 
 The LD_PRELOAD probe (preload.c) is ordinary C linked without libc
@@ -51,8 +53,8 @@ cp ptrace_init /tmp/pb-root/
 (cd /tmp/pb-root && find . | cpio -o -H newc --owner=0:0) > /tmp/ptrace-init.cpio
 
 # 2. test image: copy, make it CHR mode (no licence needed), add the ESP files
-IMG=../.work/pb-test.img        # ~1 GB; keep it on real disk, not tmpfs
-cp ../x86-7.23.7.img $IMG
+IMG=../.work/pb-test.img        # clone of the clean x86 image; keep it on real disk, not tmpfs
+cp ../x86-7.23.7-clean.img $IMG
 printf '\001' | dd of=$IMG bs=1 seek=$((0x150)) conv=notrunc status=none   # MBR mode flag -> CHR
 mcopy -i $IMG@@1048576 ::/EFI/BOOT/BOOTX64.EFI /tmp/kernel.efi             # stock kernel, from the image itself
 mcopy -i $IMG@@1048576 -o /usr/share/edk2-shell/x64/Shell.efi ::/EFI/BOOT/BOOTX64.EFI
@@ -73,8 +75,8 @@ qemu-system-x86_64 -m 1024 -smp 2 -cpu host -enable-kvm \
 
 # 4. wait ~45 s, then check
 grep -a ptrace-init /tmp/serial.log      # tracer messages
+grep -a ldpreload /tmp/serial.log        # every binary that loaded the probe
 tail -c 100 /tmp/serial.log              # should end with "CHR Login:"
-python3 -c "import re; d=open('$IMG','rb').read(); m=[x.group(0) for x in re.finditer(rb'ptrace_init hijack: OK\nexe=/ptrace_init\npid=\d+\nppid=\d+\ntime=\d+\n', d)]; print(m[-1].decode() if m else 'no flag found')" 
 kill $(cat /tmp/qemu.pid)
 ```
 
@@ -82,13 +84,14 @@ Expected tracer output:
 
 ```
 [ptrace-init] tracing pid 1
-[ptrace-init] exec /init
-[ptrace-init] sysinit is pid 120
-[ptrace-init] sysinit is pid 122
-[ptrace-init] hijacked pid 130: /nova/bin/mode -> /proc/112/exe
-[ptrace-init] pid 130 runs the payload, detaching
-[ptrace-init] all tracees detached, tracer exits
-[ptrace-init] mode hijack: wrote /flash/rw/disk/flag.txt
+[ptrace-init] exec /init (LD_PRELOAD=/ram/ldpreload.so)
+[ptrace-init] following the init into /newroot
+[ptrace-init] pid 1 mounts tmpfs on /ram
+[ptrace-init] dropped /ram/ldpreload.so (13636 bytes), detaching
+[ldpreload] loaded by /sbin/sysinit (pid=119)
+[ldpreload] loaded by /nova/bin/mode (pid=129)
+[ldpreload] loaded by /nova/bin/loader (pid=130)
+... (47 loads in total)
 ```
 
 ### Notes / gotchas
@@ -105,11 +108,10 @@ Expected tracer output:
 * `serial=test` on the USB storage is how the earlier live tests booted this
   image; it also feeds the x86 software-id (irrelevant in CHR mode).
 * For an interactive check, use a serial *socket* instead of `file:` and log
-  in as `admin` with an empty password, then `/file/tail flag.txt` and
-  `/system/license print` (should still show the normal level).  The first
-  login walks through a forced password change — skipping it with Ctrl-C
-  worked once but later logins on that image failed, so use a fresh image
-  copy if you need the CLI.
-* `docs/ptrace-init-hijack.md` lists the target behaviours the logic depends
-  on (two sysinits, the init's stage-1 re-exec, `loader`'s own ptrace use).
+  in as `admin` (the clean image is `admin`/`admin`), then look at the boot
+  console log for the `[ldpreload]` lines; `/ram/ldpreload.so` is on the
+  running system's tmpfs.  The first login may walk through a forced password
+  change — use a fresh image copy if you need the CLI.
+* `docs/ptrace-init-preload.md` lists the target behaviours the logic depends
+  on (the init's stage-1 root switch, the early `/ram` mount).
   Re-read it before "simplifying" the tracer loop.

@@ -1,17 +1,22 @@
 /*
- * ptrace_init.c - boot-time exec hijack for MikroTik RouterOS (7.x, i386)
+ * ptrace_init.c - boot-time LD_PRELOAD drop for MikroTik RouterOS (7.x, i386)
  *
  * Boot the stock initramfs with:   rdinit=/ptrace_init
  *
  *   /ptrace_init (PID 1)
- *       |-- fork -> tracer: PTRACE_SEIZE(1), follow fork/exec events; at the
- *       |           execve of "mode" patch the path to /proc/<tracer-pid>/exe
- *       `-- execve("/init")   (the real init)
+ *       |-- fork -> tracer: PTRACE_SEIZE(1) and watch the init's syscalls;
+ *       |           when it mounts a tmpfs on /ram, write the embedded probe
+ *       |           to /ram/ldpreload.so, detach and exit
+ *       `-- execve("/init")   (the real init), with LD_PRELOAD pointing at
+ *                             the probe
  *
- * Exec'd this way (as "mode"): write /flash/rw/disk/flag.txt and then
- * execve("/nova/bin/mode").
+ * Only the init is traced (no fork following): it is the process that mounts
+ * the tmpfs on /ram, early in boot_stage_mount_system(), long before
+ * sysinit/mode/loader exist.  Every dynamically linked binary started after
+ * that point loads the probe and its constructor prints the binary's name to
+ * /dev/console.
  *
- * Details, and the target behaviours this relies on: docs/ptrace-init-hijack.md
+ * Details, and the target behaviours this relies on: docs/ptrace-init-preload.md
  * Build: ./build.sh
  */
 
@@ -24,15 +29,11 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
-#include <time.h>
 #include <poll.h>
 #include <sys/types.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
-#include <sys/mount.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
-#include <limits.h>
 
 extern char **environ;
 
@@ -45,27 +46,11 @@ extern char **environ;
 #ifndef PTRACE_O_TRACESYSGOOD
 #define PTRACE_O_TRACESYSGOOD 0x00000001
 #endif
-#ifndef PTRACE_O_TRACEFORK
-#define PTRACE_O_TRACEFORK 0x00000002
-#endif
-#ifndef PTRACE_O_TRACEVFORK
-#define PTRACE_O_TRACEVFORK 0x00000004
-#endif
-#ifndef PTRACE_O_TRACECLONE
-#define PTRACE_O_TRACECLONE 0x00000008
-#endif
 #ifndef PTRACE_O_TRACEEXEC
 #define PTRACE_O_TRACEEXEC 0x00000010
 #endif
-#ifndef PTRACE_O_TRACEEXIT
-#define PTRACE_O_TRACEEXIT 0x00000040
-#endif
-#ifndef PTRACE_EVENT_FORK
-#define PTRACE_EVENT_FORK 1
-#define PTRACE_EVENT_VFORK 2
-#define PTRACE_EVENT_CLONE 3
+#ifndef PTRACE_EVENT_EXEC
 #define PTRACE_EVENT_EXEC 4
-#define PTRACE_EVENT_EXIT 6
 #define PTRACE_EVENT_STOP 128
 #endif
 #ifndef PTRACE_GET_SYSCALL_INFO
@@ -96,18 +81,15 @@ struct syscall_info {
 
 /* ------------------------------------------------------------------ config */
 
-#define ORIG_MODE     "/nova/bin/mode"		/* the real licence daemon */
-#define FLAG_PATH     "/flash/rw/disk/flag.txt"	/* written by the payload */
 #define REAL_INIT     "/init"			/* the stock init */
 
-/* Set in init_main() before execve(/init) and dropped to disk by the mode
- * payload: every binary exec'd after the payload has run loads it (if it is
- * dynamically linked) and the library prints its name to /dev/console. */
+/* Put into the environment of the stock init; the probe is dropped there by
+ * the tracer as soon as the init has mounted the tmpfs. */
 #define PRELOAD_PATH  "/ram/ldpreload.so"
 
 /* ----------------------------------------------------------------- logging */
 
-/* one write per line, so messages from the tracer and the payload do not
+/* one write per line, so messages from the tracer and the probe do not
  * interleave on the console */
 static void logmsg(const char *fmt, ...)
 {
@@ -133,61 +115,9 @@ static void logmsg(const char *fmt, ...)
 		close(fd);
 }
 
-/* ----------------------------------------------------------- tracee table */
-
-#define MAXT 256
-struct tracee {
-	pid_t pid;
-	pid_t parent;
-	int event_only;		/* PTRACE_CONT: no syscall stops */
-};
-
-static struct tracee tt[MAXT];
-static int ntt;
-static pid_t root_pid;		/* the seized init */
-static pid_t hijacked;		/* exec redirected */
-static int shutdown_flag;	/* detach and exit */
-
-static struct tracee *t_find(pid_t p)
-{
-	int i;
-	for (i = 0; i < ntt; i++)
-		if (tt[i].pid == p)
-			return &tt[i];
-	return NULL;
-}
-
-static struct tracee *t_add(pid_t p, pid_t par)
-{
-	struct tracee *t = t_find(p);
-
-	if (t) {
-		if (par)
-			t->parent = par;
-		return t;
-	}
-	if (ntt >= MAXT)
-		return NULL;
-	t = &tt[ntt++];
-	t->pid = p;
-	t->parent = par;
-	t->event_only = 0;
-	return t;
-}
-
-static void t_del(pid_t p)
-{
-	int i;
-	for (i = 0; i < ntt; i++)
-		if (tt[i].pid == p) {
-			tt[i] = tt[--ntt];
-			return;
-		}
-}
-
 /* ------------------------------------------------------ tracee memory I/O */
 
-/* PTRACE_PEEKDATA/POKEDATA: one 4-byte word, 32-bit addresses */
+/* PTRACE_PEEKDATA: one 4-byte word, 32-bit addresses */
 
 static int peek_word(pid_t pid, unsigned long long addr, unsigned long *out)
 {
@@ -197,14 +127,6 @@ static int peek_word(pid_t pid, unsigned long long addr, unsigned long *out)
 	*out = (unsigned long)ptrace(PTRACE_PEEKDATA, pid,
 				     (void *)(uintptr_t)addr, 0);
 	return errno ? -1 : 0;
-}
-
-static int poke_word(pid_t pid, unsigned long long addr, unsigned long word)
-{
-	if (addr + sizeof(unsigned long) > 0x100000000ULL)
-		return -1;
-	return ptrace(PTRACE_POKEDATA, pid, (void *)(uintptr_t)addr,
-		      (void *)word) < 0 ? -1 : 0;
 }
 
 /* read a NUL-terminated string */
@@ -231,91 +153,51 @@ static int read_cstr(pid_t pid, unsigned long long addr, char *out, size_t max)
 	return (int)max - 1;
 }
 
-/* write len bytes (read-modify-write for the tail word) */
-static int write_bytes(pid_t pid, unsigned long long addr, const void *buf,
-		       size_t len)
+/* --------------------------------------------------------------- preload */
+
+/* write the embedded probe; called once the tmpfs is mounted */
+static int drop_preload(void)
 {
-	const unsigned char *src = buf;
+	int fd = open(PRELOAD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0755);
 	size_t off = 0;
 
-	while (off < len) {
-		unsigned long word;
-		size_t n = len - off;
+	if (fd < 0)
+		return -1;
+	while (off < preload_so_len) {
+		ssize_t w = write(fd, preload_so + off, preload_so_len - off);
 
-		if (n >= sizeof(word)) {
-			memcpy(&word, src + off, sizeof(word));
-			if (poke_word(pid, addr + off, word) != 0)
-				return -1;
-			off += sizeof(word);
-		} else {
-			if (peek_word(pid, addr + off, &word) != 0)
-				return -1;
-			memcpy((unsigned char *)&word, src + off, n);
-			if (poke_word(pid, addr + off, word) != 0)
-				return -1;
-			off += n;
+		if (w <= 0) {
+			int e = errno;
+
+			close(fd);
+			errno = e;
+			return -1;
 		}
+		off += (size_t)w;
 	}
+	close(fd);
 	return 0;
 }
 
-/* ------------------------------------------------------------------ misc */
-
-static void mkdir_p(const char *path)
+/* tmpfs was mounted on /ram: drop the probe, detach the init and exit */
+static void finish(pid_t pid)
 {
-	char tmp[PATH_MAX];
-	size_t i, len;
+	if (drop_preload() == 0)
+		logmsg("dropped %s (%u bytes), detaching", PRELOAD_PATH,
+		       preload_so_len);
+	else
+		logmsg("cannot write %s: %s", PRELOAD_PATH, strerror(errno));
 
-	snprintf(tmp, sizeof(tmp), "%s", path);
-	len = strlen(tmp);
-	for (i = 1; i < len; i++) {
-		if (tmp[i] == '/') {
-			tmp[i] = 0;
-			mkdir(tmp, 0755);
-			tmp[i] = '/';
-		}
-	}
-	mkdir(tmp, 0755);
-}
-
-/* ---------------------------------------------------------------- hijack */
-
-/* Redirect the pending execve to /proc/<our pid>/exe, a magic link to this
- * binary in the initramfs.  The new path must fit in the old one. */
-static void hijack(pid_t pid, unsigned long long addr, const char *origpath)
-{
-	char newpath[32];
-	size_t origlen = strlen(origpath);
-
-	snprintf(newpath, sizeof(newpath), "/proc/%d/exe", (int)getpid());
-	if (strlen(newpath) > origlen) {
-		logmsg("hijack: %s does not fit in %s, skipping",
-		       newpath, origpath);
-		return;
-	}
-	if (write_bytes(pid, addr, newpath, strlen(newpath) + 1) != 0) {
-		logmsg("hijack: cannot patch path at %llx", addr);
-		return;
-	}
-	hijacked = pid;
-	logmsg("hijacked pid %d: %s -> %s", (int)pid, origpath, newpath);
+	ptrace(PTRACE_DETACH, pid, 0, 0);
 }
 
 /* ------------------------------------------------------------ tracer core */
 
-/* make every tracee stop soon (shutdown) */
-static void interrupt_all(void)
-{
-	int i;
-	for (i = 0; i < ntt; i++)
-		ptrace(PTRACE_INTERRUPT, tt[i].pid, 0, 0);
-}
-
 static void tracer_main(pid_t parent, int ready_fd)
 {
-	long opts = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK |
-		    PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE |
-		    PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT;
+	long opts = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC;
+	int mount_armed = 0;	/* mount() entry seen, check the exit stop */
+	int root_armed = 0;	/* mount("tmpfs", "/newroot") seen */
 
 	if (ptrace(PTRACE_SEIZE, parent, 0, (void *)opts) < 0) {
 		logmsg("PTRACE_SEIZE(%d) failed: %s", (int)parent,
@@ -327,8 +209,6 @@ static void tracer_main(pid_t parent, int ready_fd)
 		}
 		return;
 	}
-	root_pid = parent;
-	t_add(parent, 0);
 	logmsg("tracing pid %d", (int)parent);
 	if (ready_fd >= 0) {
 		char c = 'R';
@@ -338,73 +218,27 @@ static void tracer_main(pid_t parent, int ready_fd)
 
 	for (;;) {
 		int status;
-		pid_t pid;
-		struct tracee *t;
 		unsigned ev;
 		int sig;
 
-		pid = waitpid(-1, &status, __WALL);
-		if (pid < 0) {
-			if (errno == ECHILD) {
-				logmsg("no tracees left, tracer exits");
-				return;
-			}
-			continue;	/* EINTR and friends */
+		if (waitpid(parent, &status, __WALL) < 0) {
+			if (errno == EINTR)
+				continue;
+			logmsg("waitpid: %s", errno == ECHILD ?
+			       "init is gone" : strerror(errno));
+			return;
 		}
 		if (WIFEXITED(status) || WIFSIGNALED(status)) {
-			t_del(pid);
-			continue;
+			logmsg("init exited, tracer exits");
+			return;
 		}
 
 		ev = (unsigned)status >> 16;
 		sig = WSTOPSIG(status);
-		t = t_find(pid);
-		if (!t)
-			t = t_add(pid, 0);
-		if (!t) {
-			ptrace(PTRACE_DETACH, pid, 0, 0);
-			continue;
-		}
 
-		if (shutdown_flag) {
-			ptrace(PTRACE_DETACH, pid, 0, 0);
-			t_del(pid);
-			if (ntt == 0) {
-				logmsg("all tracees detached, tracer exits");
-				return;
-			}
-			continue;
-		}
-
-		if (ev == PTRACE_EVENT_FORK || ev == PTRACE_EVENT_VFORK ||
-		    ev == PTRACE_EVENT_CLONE) {
-			unsigned long msg = 0;
-
-			ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg);
-			t_add((pid_t)msg, pid);
-			ptrace(t->event_only ? PTRACE_CONT : PTRACE_SYSCALL,
-			       pid, 0, 0);
-			continue;
-		}
-		if (ev == PTRACE_EVENT_EXEC) {
-			if (pid == hijacked) {
-				logmsg("pid %d runs the payload, detaching",
-				       (int)pid);
-				ptrace(PTRACE_DETACH, pid, 0, 0);
-				t_del(pid);
-				shutdown_flag = 1;
-				interrupt_all();
-				if (ntt == 0)
-					return;
-				continue;
-			}
-			ptrace(t->event_only ? PTRACE_CONT : PTRACE_SYSCALL,
-			       pid, 0, 0);
-			continue;
-		}
-		if (ev == PTRACE_EVENT_EXIT || ev == PTRACE_EVENT_STOP) {
-			ptrace(t->event_only ? PTRACE_CONT : PTRACE_SYSCALL,
-			       pid, 0, 0);
+		/* event stops (exec, group-stop): keep tracing */
+		if (ev == PTRACE_EVENT_EXEC || ev == PTRACE_EVENT_STOP) {
+			ptrace(PTRACE_SYSCALL, parent, 0, 0);
 			continue;
 		}
 
@@ -414,58 +248,73 @@ static void tracer_main(pid_t parent, int ready_fd)
 			long r;
 
 			memset(&si, 0, sizeof(si));
-			r = ptrace(PTRACE_GET_SYSCALL_INFO, pid,
+			r = ptrace(PTRACE_GET_SYSCALL_INFO, parent,
 				   (void *)sizeof(si), &si);
 			if (r >= 0 && si.op == SYSCALL_INFO_ENTRY) {
-				/* execve 11/59, execveat 358/322 (i386/x86_64) */
-				unsigned long long nr = si.u.entry.nr;
-				int is_exec = (nr == 11 || nr == 59);
-				int is_execat = (nr == 322 || nr == 358);
+				if (si.u.entry.nr == SYS_mount) {
+					/* mount(source, target, fstype, flags, data) */
+					char target[256], fstype[64];
 
-				if (is_exec || is_execat) {
-					unsigned long long a =
-					    si.u.entry.args[is_exec ? 0 : 1];
-					char path[PATH_MAX];
-
-					if (a && read_cstr(pid, a, path,
-							   sizeof(path)) > 0) {
-						const char *base =
-						    strrchr(path, '/');
-						base = base ? base + 1 : path;
-
-						if (!strcmp(base, "sysinit")) {
-							/* it forks mode */
-							logmsg("sysinit is pid %d",
-							       (int)pid);
-							if (t_find(root_pid))
-								t_find(root_pid)->event_only = 1;
-						} else if (!strcmp(base, "mode")) {
-							if (!hijacked)
-								hijack(pid, a, path);
-						} else if (pid == root_pid) {
-							/* init re-execs itself */
-						} else {
-							/* loader etc.: untraced */
-							ptrace(PTRACE_DETACH, pid, 0, 0);
-							t_del(pid);
-							continue;
+					if (read_cstr(parent, si.u.entry.args[1],
+						      target, sizeof(target)) > 0 &&
+					    read_cstr(parent, si.u.entry.args[2],
+						      fstype, sizeof(fstype)) > 0 &&
+					    !strcmp(fstype, "tmpfs")) {
+						if (!strcmp(target, "/ram")) {
+							mount_armed = 1;
+							logmsg("pid %d mounts tmpfs on /ram",
+							       (int)parent);
+						} else if (!strcmp(target, "/newroot")) {
+							root_armed = 1;
 						}
 					}
 				}
+			} else if (r >= 0 && si.op == SYSCALL_INFO_EXIT &&
+				   (mount_armed || root_armed)) {
+				long long rv = si.u.exit.rval;
+
+				if (root_armed) {
+					root_armed = 0;
+					if (rv == 0) {
+						/* the init is about to move this
+						 * tmpfs to "/" and chroot into it;
+						 * follow it now, while /newroot is
+						 * still visible from here */
+						if (chdir("/newroot") != 0 ||
+						    chroot(".") != 0 ||
+						    chdir("/") != 0)
+							logmsg("cannot follow into /newroot: %s",
+							       strerror(errno));
+						else
+							logmsg("following the init into /newroot");
+					}
+				}
+				if (mount_armed) {
+					mount_armed = 0;
+					if (rv == 0) {
+						/* the tmpfs is live in our
+						 * namespace too - drop the probe
+						 * and let go */
+						finish(parent);
+						return;
+					}
+					logmsg("pid %d: mount(tmpfs, /ram) failed: %lld",
+					       (int)parent, rv);
+				}
 			}
-			ptrace(PTRACE_SYSCALL, pid, 0, 0);
+			ptrace(PTRACE_SYSCALL, parent, 0, 0);
 			continue;
 		}
 
 		/* any other stop: forward real signals, swallow SIGTRAP */
-		ptrace(t->event_only ? PTRACE_CONT : PTRACE_SYSCALL, pid, 0,
+		ptrace(PTRACE_SYSCALL, parent, 0,
 		       (void *)(long)(sig == SIGTRAP ? 0 : sig));
 	}
 }
 
 /* ------------------------------------------------------------ init part */
 
-static void init_main(int argc, char **argv, char **envp)
+static void init_main(int argc, char **argv)
 {
 	int fds[2];
 	pid_t t;
@@ -511,96 +360,15 @@ static void init_main(int argc, char **argv, char **envp)
 		pause();
 }
 
-/* --------------------------------------------------- payload (as "mode") */
-
-static void mode_main(int argc, char **argv, char **envp)
-{
-	char self[PATH_MAX] = "?";
-	char dir[PATH_MAX];
-	ssize_t n;
-	int fd;
-
-	(void)argc;
-
-	n = readlink("/proc/self/exe", self, sizeof(self) - 1);
-	if (n > 0)
-		self[n] = 0;		/* for the flag text */
-
-	/* drop the LD_PRELOAD probe where the boot environment points at it;
-	 * everything exec'd from here on loads it and logs its own name */
-	mkdir_p("/ram");
-	{
-		int sfd = open(PRELOAD_PATH,
-			       O_WRONLY | O_CREAT | O_TRUNC, 0755);
-		if (sfd >= 0) {
-			size_t off = 0;
-			ssize_t w;
-
-			while (off < preload_so_len) {
-				w = write(sfd, preload_so + off,
-					  preload_so_len - off);
-				if (w <= 0)
-					break;
-				off += (size_t)w;
-			}
-			close(sfd);
-			if (off == preload_so_len)
-				logmsg("mode hijack: dropped %s (%u bytes)",
-				       PRELOAD_PATH, preload_so_len);
-			else
-				logmsg("mode hijack: short write to %s",
-				       PRELOAD_PATH);
-		} else {
-			logmsg("mode hijack: cannot write %s: %s",
-			       PRELOAD_PATH, strerror(errno));
-		}
-	}
-
-	/* /flash/rw/disk normally exists */
-	snprintf(dir, sizeof(dir), "%s", FLAG_PATH);
-	{
-		char *slash = strrchr(dir, '/');
-		if (slash) {
-			*slash = 0;
-			mkdir_p(dir);
-		}
-	}
-	fd = open(FLAG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-	if (fd >= 0) {
-		const char *pl = getenv("LD_PRELOAD");
-
-		dprintf(fd,
-			"ptrace_init hijack: OK\n"
-			"exe=%s\n"
-			"pid=%d\n"
-			"ppid=%d\n"
-			"time=%ld\n"
-			"ld_preload=%s\n",
-			self, (int)getpid(), (int)getppid(), (long)time(NULL),
-			pl ? pl : "(unset)");
-		close(fd);
-		logmsg("mode hijack: wrote %s (LD_PRELOAD=%s)", FLAG_PATH,
-		       pl ? pl : "(unset)");
-	} else {
-		logmsg("mode hijack: cannot write %s: %s", FLAG_PATH,
-		       strerror(errno));
-	}
-
-	/* the real licence daemon */
-	execv(ORIG_MODE, argv);
-	logmsg("mode hijack: execv(%s): %s", ORIG_MODE, strerror(errno));
-	_exit(127);
-}
-
 /* ------------------------------------------------------------------ main */
 
-int main(int argc, char **argv, char **envp)
+int main(int argc, char **argv)
 {
-	/* PID 1 is the wrapper, anything else is the payload */
-	if (getpid() == 1) {
-		init_main(argc, argv, envp);
-		return 0;
+	if (getpid() != 1) {
+		fprintf(stderr, "ptrace_init: must run as PID 1 "
+			"(boot with rdinit=/ptrace_init)\n");
+		return 1;
 	}
-	mode_main(argc, argv, envp);
-	return 127;
+	init_main(argc, argv);
+	return 0;
 }

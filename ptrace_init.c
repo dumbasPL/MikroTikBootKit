@@ -5,10 +5,17 @@
  *
  *   /ptrace_init (PID 1)
  *       |-- fork -> tracer: PTRACE_SEIZE(1) and watch the init's syscalls;
- *       |           when it mounts a tmpfs on /ram, write the embedded probe
- *       |           to /ram/ldpreload.so, detach and exit
+ *       |           when it mounts a tmpfs on /ram, make the embedded probe
+ *       |           available as /ram/ldpreload.so, detach and exit
  *       `-- execve("/init")   (the real init), with LD_PRELOAD pointing at
  *                             the probe
+ *
+ * The probe is embedded in this binary.  PID 1 also writes a copy of it to
+ * /ptrace_init.so on the initramfs (rootfs) and keeps an open fd; when the
+ * /ram tmpfs appears, the tracer bind-mounts the file from that fd over
+ * /ram/ldpreload.so.  The bind mount keeps the rootfs inode, which matters on
+ * 7.24.4: that kernel refuses PROT_EXEC mappings of tmpfs files (the ldso
+ * would silently skip the probe), but rootfs inodes stay exec-mappable.
  *
  * Only the init is traced (no fork following): it is the process that mounts
  * the tmpfs on /ram, early in boot_stage_mount_system(), long before
@@ -34,8 +41,11 @@
 #include <sys/wait.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
+#include <sys/mount.h>
 
 extern char **environ;
+
+static int stash_fd = -1;
 
 /* the LD_PRELOAD probe (preload.c), embedded by build.sh */
 #include "preload_so.h"
@@ -86,6 +96,13 @@ struct syscall_info {
 /* Put into the environment of the stock init; the probe is dropped there by
  * the tracer as soon as the init has mounted the tmpfs. */
 #define PRELOAD_PATH  "/ram/ldpreload.so"
+
+/* PID 1 keeps a copy of the probe on the initramfs (rootfs/ramfs) and the
+ * tracer inherits an open fd to it.  On 7.24.4 the kernel refuses PROT_EXEC
+ * mappings of tmpfs files, but a rootfs inode stays exec-mappable, so the
+ * probe is bind-mounted from that fd (/proc/self/fd/N) over PRELOAD_PATH
+ * instead of being written onto the tmpfs. */
+#define PRELOAD_SRC       "/ptrace_init.so"
 
 /* ----------------------------------------------------------------- logging */
 
@@ -155,10 +172,10 @@ static int read_cstr(pid_t pid, unsigned long long addr, char *out, size_t max)
 
 /* --------------------------------------------------------------- preload */
 
-/* write the embedded probe; called once the tmpfs is mounted */
-static int drop_preload(void)
+/* write the embedded probe to path (mode 0755) */
+static int write_preload(const char *path)
 {
-	int fd = open(PRELOAD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
 	size_t off = 0;
 
 	if (fd < 0)
@@ -179,15 +196,53 @@ static int drop_preload(void)
 	return 0;
 }
 
+/* create an empty regular file (bind-mount target) */
+static int touch_file(const char *path)
+{
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+
+	if (fd < 0)
+		return -1;
+	close(fd);
+	return 0;
+}
+
+/* stash a copy of the probe on the initramfs; run as PID 1 before the real
+ * init is exec'd. */
+static void stash_preload(void)
+{
+	if (write_preload(PRELOAD_SRC) != 0)
+		logmsg("cannot stash %s: %s", PRELOAD_SRC, strerror(errno));
+}
+
+/* tmpfs was mounted on /ram: make the probe available at PRELOAD_PATH by
+ * bind-mounting the rootfs copy (exec-mappable everywhere, unlike a copy on
+ * the tmpfs), then detach the init and exit. */
+static void drop_preload(void)
+{
+	char src[64];
+
+	if (touch_file(PRELOAD_PATH) != 0) {
+		logmsg("cannot create %s: %s", PRELOAD_PATH, strerror(errno));
+		return;
+	}
+	if (stash_fd < 0) {
+		logmsg("%s is not open, cannot bind %s", PRELOAD_SRC,
+		       PRELOAD_PATH);
+		return;
+	}
+	snprintf(src, sizeof(src), "/proc/self/fd/%d", stash_fd);
+	if (mount(src, PRELOAD_PATH, NULL, MS_BIND, NULL) != 0)
+		logmsg("cannot bind %s -> %s: %s", src, PRELOAD_PATH,
+		       strerror(errno));
+	else
+		logmsg("bind-mounted %s -> %s, detaching", src, PRELOAD_PATH);
+}
+
 /* tmpfs was mounted on /ram: drop the probe, detach the init and exit */
 static void finish(pid_t pid)
 {
-	if (drop_preload() == 0)
-		logmsg("dropped %s (%u bytes), detaching", PRELOAD_PATH,
-		       preload_so_len);
-	else
-		logmsg("cannot write %s: %s", PRELOAD_PATH, strerror(errno));
-
+	drop_preload();
 	ptrace(PTRACE_DETACH, pid, 0, 0);
 }
 
@@ -325,6 +380,14 @@ static void init_main(int argc, char **argv)
 		for (;;)
 			pause();
 	}
+
+	stash_preload();
+	/* O_CLOEXEC: the tracer (which never execs) keeps the inherited copy,
+	 * while PID 1's copy closes when it execs the stock init, so the fd
+	 * does not leak into RouterOS */
+	stash_fd = open(PRELOAD_SRC, O_RDONLY | O_CLOEXEC);
+	if (stash_fd < 0)
+		logmsg("cannot open %s: %s", PRELOAD_SRC, strerror(errno));
 
 	if (pipe(fds) != 0) {
 		logmsg("pipe: %s", strerror(errno));

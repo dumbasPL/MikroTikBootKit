@@ -20,6 +20,8 @@ Design notes, the target behaviours it relies on and the observed boot log:
 ptrace_init.c               the tool (static i386)
 preload.c                   LD_PRELOAD probe (normal C, imports resolved by the ldso)
 build.sh                    builds + embeds the probe, then the tool
+vmtest.sh                   prepare/boot/interact with a test image copy
+vmconsole.py                serial-console helper used by vmtest.sh cmd
 docs/ptrace-init-preload.md design + findings + verified log
 ```
 
@@ -44,6 +46,9 @@ Needs: KVM (`-enable-kvm` is mandatory), `edk2-ovmf` + `edk2-shell` (or any
 EFI shell binary), `mtools`, `cpio`, and a RouterOS x86 image.  Use a *copy*
 of the image; the ESP (partition 1) is rewritten.  Always kill the VM by
 pidfile when done — do not leave QEMU instances running.
+
+`./vmtest.sh test` does all of the following on a copy (and
+`./vmtest.sh cmd "<cli command>"` logs into the running VM as admin/admin):
 
 ```sh
 # 1. build + initrd
@@ -87,7 +92,7 @@ Expected tracer output:
 [ptrace-init] exec /init (LD_PRELOAD=/ram/ldpreload.so)
 [ptrace-init] following the init into /newroot
 [ptrace-init] pid 1 mounts tmpfs on /ram
-[ptrace-init] dropped /ram/ldpreload.so (13636 bytes), detaching
+[ptrace-init] bind-mounted /proc/self/fd/N -> /ram/ldpreload.so, detaching
 [ldpreload] loaded by /sbin/sysinit (pid=119)
 [ldpreload] loaded by /nova/bin/mode (pid=129)
 [ldpreload] loaded by /nova/bin/loader (pid=130)
@@ -96,6 +101,11 @@ Expected tracer output:
 
 ### Notes / gotchas
 
+* **Known versions:** works on 7.23.7 and 7.24.4 (both x86 and CHR mode,
+  40-47 loads, boot reaches the login prompt).  On 7.24.4 the kernel refuses
+  `PROT_EXEC` mappings of tmpfs files, so the probe is not written to `/ram`
+  but bind-mounted there from a copy kept on the initramfs.  Details:
+  `docs/ptrace-init-preload.md`.
 * **Do not boot with QEMU's `-kernel` + `-initrd`.**  It was tried: the
   wrapper runs, but the stock init then fails (`opendir: No such file or
   directory` → `ERROR: no system package found!`) and the kernel panics.  The

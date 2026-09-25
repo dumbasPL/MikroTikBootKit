@@ -2,13 +2,20 @@
 
 Runtime alternative to patching the NPK: the initramfs init is replaced by a
 small binary that ptrace-attaches to the real init and waits for it to mount
-the tmpfs on `/ram`.  As soon as the mount succeeds the tracer writes an
-embedded shared object to `/ram/ldpreload.so`, detaches the init and
-exits.  The wrapper put `LD_PRELOAD=/ram/ldpreload.so` into the environment
-before exec'ing `/init`, so every dynamically linked binary started after the
-mount - `sysinit`, `mode`, `loader`, all services - loads the probe, and the
-probe's constructor prints the binary's own name to `/dev/console`.  Nothing
-in the RouterOS image is modified.
+the tmpfs on `/ram`.  As soon as the mount succeeds the tracer makes an
+embedded shared object available as `/ram/ldpreload.so`, detaches the init
+and exits.  The wrapper put `LD_PRELOAD=/ram/ldpreload.so` into the
+environment before exec'ing `/init`, so every dynamically linked binary
+started after the mount - `sysinit`, `mode`, `loader`, all services - loads
+the probe, and the probe's constructor prints the binary's own name to
+`/dev/console`.  Nothing in the RouterOS image is modified.
+
+The probe reaches `/ram` by **bind mount** from a copy on the initramfs
+(rootfs).  This is not cosmetic: the 7.24.4 kernel refuses `PROT_EXEC`
+mappings of tmpfs files, so a plain byte copy on `/ram` would never load
+there; a rootfs inode stays exec-mappable even when bind-mounted onto the
+tmpfs.  A failure to make any of the mounts is logged; the boot itself is
+unaffected and simply runs without the probe.
 
 Source: `ptrace_init.c` (build: `./build.sh`).  Part of MikroTikBootKit.
 
@@ -16,14 +23,23 @@ Source: `ptrace_init.c` (build: `./build.sh`).  Part of MikroTikBootKit.
 
 ```
 kernel -> /ptrace_init (PID 1)
+    |-- write the embedded probe to /ptrace_init.so (initramfs/rootfs)
+    |   and keep it open
     |-- fork -> tracer
     |     PTRACE_SEIZE(PID 1) with TRACESYSGOOD|TRACEEXEC, then watch the
     |     init's syscalls (no fork following - the init is the only tracee)
     |       * mount("tmpfs","/newroot",...) -> chroot into it (see below)
-    |       * mount("tmpfs","/ram",...)     -> write /ram/ldpreload.so,
-    |         detach the init and exit
+    |       * mount("tmpfs","/ram",...)     -> bind /proc/self/fd/N over
+    |         /ram/ldpreload.so, detach the init and exit
     `-- execve("/init")   (the real init; LD_PRELOAD=/ram/ldpreload.so)
 ```
+
+The bind source is the tracer's inherited fd to the rootfs file
+(`/proc/self/fd/N`), so it works even after the initramfs is detached.  The
+`/ram` mount is the one the init moves into the final root, which is why the
+probe is placed there: it is reachable as `/ram/ldpreload.so` by every
+service, and the bind keeps the rootfs backing that makes it mappable on
+7.24.4.
 
 The probe (`preload.c`) is a plain i386 shared object built without libc
 (`-nostdlib`): no `DT_NEEDED`, the imports (`open`/`write`/`readlink`/
@@ -50,6 +66,16 @@ embeds it in the init binary as a C array.  Its ELF constructor reads
   of the tmpfs mount, while `/newroot` is still visible in its (old) root.
   Without this the tracer stays rooted in the old initramfs and `/ram` does
   not exist for it (the drop fails with `ENOENT`).
+* **The probe is bind-mounted, not copied.**  `mount(2)` with `MS_BIND`
+  keeps the source inode, so the file on the initramfs (rootfs) can be
+  reached at `/ram/ldpreload.so` while staying rootfs-backed.  On 7.24.4 the
+  kernel refuses `PROT_EXEC` mappings of tmpfs files but allows rootfs files;
+  a byte copy on `/ram` would therefore never load there.  The bind source is
+  the tracer's inherited fd (`/proc/self/fd/N`), so it does not depend on the
+  initramfs still being reachable by path.  `/ram` is used as the target
+  because it is the mount the init moves into the final root; a file parked
+  in the stage-1 root would be detached with it at `pivot_root`.  See the
+  7.24.4 section below for the mapping matrix.
 * **`/ram` is mounted early.**  `boot_stage_mount_system()` mounts the tmpfs on
   `/ram` (0x80525A4 in the 7.23.7 init) before it spawns `sysinit`, so the
   probe is already there when `sysinit`, `mode`, `loader` and the services are
@@ -66,16 +92,16 @@ embeds it in the init binary as a C array.  Its ELF constructor reads
 * **32-bit tracer.**  Built as a static i386 binary (musl) to match RouterOS
   userspace, so `PTRACE_PEEKDATA` uses 4-byte words and 32-bit addresses.
 
-## Verified on 7.23.7 (CHR-mode x86 install, QEMU/KVM)
+## Verified on 7.23.7 and 7.24.4 (CHR-mode x86 install, QEMU/KVM)
 
-Serial log of a boot with `rdinit=/ptrace_init`:
+Serial log of a boot with `rdinit=/ptrace_init` (current build):
 
 ```
 [ptrace-init] tracing pid 1
 [ptrace-init] exec /init (LD_PRELOAD=/ram/ldpreload.so)
 [ptrace-init] following the init into /newroot
 [ptrace-init] pid 1 mounts tmpfs on /ram
-[ptrace-init] dropped /ram/ldpreload.so (13636 bytes), detaching
+[ptrace-init] bind-mounted /proc/self/fd/3 -> /ram/ldpreload.so, detaching
 [ldpreload] loaded by /sbin/sysinit (pid=119)
 [ldpreload] loaded by /sbin/fsck.ext2 (pid=120)
 [ldpreload] loaded by /sbin/sysinit (pid=121)
@@ -85,8 +111,13 @@ Serial log of a boot with `rdinit=/ptrace_init`:
 [ldpreload] loaded by /nova/bin/sstore (pid=127)
 [ldpreload] loaded by /nova/bin/mode (pid=129)
 [ldpreload] loaded by /nova/bin/loader (pid=130)
-... 47 loads in total; the boot reaches "CHR Login:" normally
+... 42-47 loads in total; the boot reaches "CHR Login:" normally
 ```
+
+The same build reaches the login prompt with 42-45 loads on 7.24.4.  The
+older build, which wrote the probe bytes to `/ram`, logged
+`dropped /ram/ldpreload.so (13636 bytes), detaching` instead; it does not
+load on 7.24.4, which is why the bind-mount route replaced it.
 
 ## Usage
 
@@ -144,6 +175,108 @@ The paths are compile-time constants at the top of `ptrace_init.c`
 (`REAL_INIT`, `PRELOAD_PATH`); the mount strings the tracer matches
 (`/newroot`, `/ram`, `tmpfs`) are stock-init behaviour - re-check them when
 moving to another RouterOS version.
+
+## Test harness (`vmtest.sh`, `vmconsole.py`)
+
+`vmtest.sh` automates everything above on a *copy* of an image (the source
+image is never touched):
+
+```sh
+./vmtest.sh prepare              # build, copy the image, write the ESP files
+./vmtest.sh boot                 # start QEMU (background, serial on a socket)
+./vmtest.sh wait 60              # wait for the login prompt
+./vmtest.sh check                # show the tracer + ldpreload lines
+./vmtest.sh cmd "/system license print"   # log in (admin/admin) and run one CLI command
+./vmtest.sh login                # attach to the serial console (Ctrl-] quits)
+./vmtest.sh stop                 # kill the VM
+./vmtest.sh test                 # prepare + boot + wait + check
+```
+
+Environment knobs: `IMG_SRC` (source image, default
+`x86-7.24.4-clean.img`), `WORK` (scratch dir, default `/tmp/opencode/bkvm`),
+`MODE=chr|x86|keep` (override the MBR mode flag), `MEM`, `SMP`.  `vmconsole.py`
+is the serial helper used by `vmtest.sh cmd`: it logs in as admin/admin,
+declines the forced password change and runs the command.
+
+## 7.24.4 denies PROT_EXEC mmaps of tmpfs files - solved with a bind mount
+
+Verified on the stock 7.24.4 image (md5 of its kernel and of the ISO's
+`isolinux/linux` are identical: `bd5305cb4887cadc1a6b3a2f7f13e254`): the
+tracer runs and drops `/ram/ldpreload.so` normally, every service inherits
+`LD_PRELOAD=/ram/ldpreload.so`, and the dynamic loader even **opens**
+`/ram/ldpreload.so` successfully - but the library never appears in any
+process's maps and no constructor runs.
+
+Syscall tracing the ldso (`mmap2` with `PROT_READ|PROT_EXEC`,
+`MAP_PRIVATE|MAP_FIXED`, offset 0x1000 into the probe) shows the kernel
+rejects the mapping with `ENOTDIR` (errno 20).  A standalone probe (boot the
+same kernel with a tiny `rdinit=` that calls `mmap` directly) reproduces it
+without any RouterOS code:
+
+| mapping                                   | 7.23.7 | 7.24.4 |
+|---|---|---|
+| anonymous, `PROT_READ\|PROT_EXEC`          | ok     | **ENOTDIR** |
+| anonymous, `PROT_EXEC` only                | ok     | **ENOTDIR** |
+| anonymous RW then `mprotect(RX)`           | ok     | ok      |
+| tmpfs file, `PROT_READ\|PROT_EXEC`         | ok     | **ENOTDIR** |
+| ramfs file, `PROT_READ\|PROT_EXEC`         | ok     | **ENOTDIR** |
+| rootfs/initramfs file, RX                  | ok     | ok      |
+| squashfs file (the mounted NPK), RX        | ok     | ok      |
+| ext4 file on the system disk, RX            | ok     | **ENOTDIR** |
+
+So on 7.24.4 the kernel only allows `PROT_EXEC` mappings from the squashfs
+system image and from the initramfs rootfs; tmpfs, ramfs, ext4 and anonymous
+exec mappings are refused.  That is what breaks the plain byte-copy drop: the
+probe lands on the `/ram` tmpfs, the ldso cannot map it and silently
+continues.  (The same restriction affects any other `LD_PRELOAD`/JIT/
+memfd-exec mechanism that maps code out of tmpfs.)
+
+### The fix: bind the rootfs copy over the tmpfs path
+
+The restriction follows the **backing filesystem of the inode**, not the path
+or mount point where the file is reached.  A `mount(2)` `MS_BIND` of a file
+keeps the source inode, so a copy of the probe that lives on the initramfs
+(rootfs) can be bind-mounted over `/ram/ldpreload.so` and stays
+exec-mappable.  Verified in-guest on 7.24.4 with a dedicated `rdinit=`
+(`mmmini3`):
+
+| file reached through                    | backing fs | 7.24.4 RX map |
+|---|---|---|
+| `/sub/f.bin`                            | rootfs     | ok            |
+| `/mnt/bindroot.bin` (bind of rootfs)    | rootfs     | **ok**        |
+| `/bindtmp.bin` (bind of tmpfs)          | tmpfs      | ENOTDIR       |
+| `/mnt/t.bin`                            | tmpfs      | ENOTDIR       |
+
+The bootkit now uses this:
+
+1. Before exec'ing the real init, PID 1 writes the embedded probe to
+   `/ptrace_init.so` on the **initramfs** and keeps it open
+   (`stash_preload()`); the tracer inherits the fd.
+2. When the init mounts tmpfs on `/ram`, the tracer creates
+   `/ram/ldpreload.so` and bind-mounts `/proc/self/fd/N` over it
+   (`drop_preload()`), then detaches.  The bind keeps the rootfs inode, and
+   `/ram` is moved into the final root by the init, so every service reaches
+   the probe at `/ram/ldpreload.so`.
+
+A file parked in the stage-1 root would *not* work: the init detaches that
+root at `pivot_root` + `umount2(MNT_DETACH)`, and the services are chrooted
+into the squashfs system root.  (Tested: `LD_PRELOAD=/ptrace-home.so` with
+the staging bind gives 0 loads; the `/ram` bind is what carries the file
+into the final root.)
+
+Every mount is checked: a failure is logged with `strerror(errno)` and the
+boot continues without the probe (the same behaviour as a failed drop had
+before).  Serial log of a working run:
+
+```
+[ptrace-init] pid 1 mounts tmpfs on /ram
+[ptrace-init] bind-mounted /proc/self/fd/3 -> /ram/ldpreload.so, detaching
+... 42 loads on 7.24.4, boot reaches CHR Login:
+```
+
+Likely cause of the kernel behaviour: a hardening patch in the 7.24.4 kernel
+to its `mmap`/`file_operations` path (the kernels are stripped, so this was
+established behaviourally, not from source).
 
 ## Notes
 

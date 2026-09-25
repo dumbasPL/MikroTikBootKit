@@ -1,3 +1,5 @@
 /ptrace_init
 /preload.so
 /preload_so.h
+*.img
+*.iso

@@ -1,15 +1,14 @@
 /*
  * keygen.c - licence keygen for the RouterOS LD_PRELOAD probe
  *
- * Adapted from MikroTikPatch's keygen/keygen.c (the standalone keygen and
- * /nova/bin/mode replacement).  This copy keeps only what the probe needs to
- * generate and install a licence from inside the running /nova/bin/mode:
- * the embedded key pair, Curve25519 EC-KCDSA signing, MT_SHA256, the
- * MT_Transform/base64 helpers, the software-id and 512-byte licence blob
- * handling, and the CHR/x86 licence-value derivation.  The CLI, the mode
- * hand-over to mode2 and the self test are not part of this copy, and no
- * function ever calls exit() - errors are returned and described by
- * kg_error().
+ * The standalone RouterOS licence keygen (the same one used to replace
+ * /nova/bin/mode) trimmed to what the probe needs to generate and install a
+ * licence from inside the running /nova/bin/mode: the embedded key pair,
+ * Curve25519 EC-KCDSA signing, MT_SHA256, the MT_Transform/base64 helpers,
+ * the software-id and 512-byte licence blob handling, and the CHR/x86
+ * licence-value derivation.  The CLI, the mode hand-over to mode2 and the
+ * self test are not part of this copy, and no function ever calls exit() -
+ * errors are returned and described by kg_error().
  *
  * The key pair is baked in at compile time (build.sh, from keys.env):
  *

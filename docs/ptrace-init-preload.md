@@ -140,7 +140,12 @@ Build:
                                   #    bootkit.efi (EFI loader, see bootloader/)
                                   #    bootkit.img (32 MB USB stick image)
 DEBUG=1 ./build.sh                # test build: serial console + verbose logs
+EFI_CC=x86_64-w64-mingw32-gcc ./build.sh   # build the loader with gcc
 ```
+
+The i386 binary is always built against musl; when `.toolchain/i386-musl` is
+missing, `build.sh` runs `tools/musl_i386.sh` (multilib host gcc + network)
+by itself.
 
 Install: `./build.sh` packs the binary into a cpio and embeds that in the EFI
 loader (`bootkit.efi`), which boots it with `rdinit=/ptrace_init`.  The stock
@@ -345,13 +350,13 @@ established behaviourally, not from source).
 ## Runtime licence: keygen + key patches
 
 The probe does more than log when it is loaded into the licence components.
-This is the runtime equivalent of what MikroTikPatch does to the NPK (patch
-the key material in `mode`/`keyman`, install the keygen as `mode`) plus the
+This is the runtime equivalent of patching the NPK (patching the key
+material in `mode`/`keyman`, installing the keygen as `mode`) plus the
 recovered reference tool's loader trick - but nothing is written to the
 image; the changes live in those processes and in the 512-byte licence blob.
 
 * **`/nova/bin/mode`** - the embedded keygen runs first: `preload.c`
-  `#include`s `keygen.c`, a copy of MikroTikPatch's keygen trimmed to the
+  `#include`s `keygen.c`, the standalone keygen trimmed to the
   generation role (CLI, mode2 hand-over and self test removed; no `exit()`;
   `kg_generate()`/`kg_error()` API), and calls it in the constructor, i.e.
   before `mode`'s `main` can read the blob.  It generates the software id if
@@ -361,9 +366,7 @@ image; the changes live in those processes and in the 512-byte licence blob.
   keygen installed as `/nova/bin/mode` does.  `stored_licence_valid()` keeps
   an already-installed licence, so there is no re-sign/reboot loop; the
   constructor logs `licence generated` or `licence already installed` with the
-  System ID to `/dev/console`, and failures with `kg_error()`.  (The copy is
-  deliberately not merged back: MikroTikPatch keeps the standalone CLI and the
-  device role.)
+  System ID to `/dev/console`, and failures with `kg_error()`.
 * **`/nova/bin/mode` and `/nova/bin/keyman`** - the stock licence public key
   is replaced in the process's own text.  On i386 the key is not stored as a
   byte string: the verifier builds it on the stack with eight
@@ -371,8 +374,8 @@ image; the changes live in those processes and in the 512-byte licence blob.
   `.text` with up to 6 opcode bytes between them (`7.23.7 mode` at file
   offset `0x5e23`, `keyman` at `0x765e`; the 7.24.4 binaries are identical).
   The probe scans the executable's `r-xp` mapping from `/proc/self/maps`,
-  matches the chunks with the same greedy gap search as MikroTikPatch's
-  `ReplaceKeyArch()` and rewrites the chunks in place, leaving the
+  matches the chunks with the same greedy gap search as the reference key
+  patcher and rewrites the chunks in place, leaving the
   instruction bytes alone.  Only the private (COW) mapping is written.
 * **`/nova/bin/loader`** - its `memcmp` GOT slot is redirected to a stub that
   always returns 0.  The loader's licence verifier ends in
@@ -391,11 +394,11 @@ The pages are made writable for the patch.  7.24.4 rejects
 asks for `rw` and restores `r-x` afterwards; the first 7.24.4 run showed
 `licence key patched (0 site)` until that was fixed.
 
-The key pair and the stock key come from `keys.env` at build time (the
-repo-local one when present, otherwise MikroTikPatch's;
-`CUSTOM_LICENSE_PUBLIC_KEY`/`CUSTOM_LICENSE_PRIVATE_KEY`,
-`MIKRO_LICENSE_PUBLIC_KEY`), so the signature the keygen makes verifies
-against the key the probe patches in.
+The key pair and the stock key come from `keys.env` at build time when the
+file is present (`CUSTOM_LICENSE_PUBLIC_KEY`/`CUSTOM_LICENSE_PRIVATE_KEY`,
+`MIKRO_LICENSE_PUBLIC_KEY`; see `keys.env.example`), otherwise the defaults
+baked into `keygen.c`/`preload.c` are used, so the signature the keygen
+makes verifies against the key the probe patches in.
 
 Verified on CHR-mode x86 installs (`MODE=chr`), 7.23.7 and 7.24.4, first boot
 and reboot (the blob persists in sector 0):

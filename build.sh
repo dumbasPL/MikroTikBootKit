@@ -8,27 +8,24 @@
 # Usage: ./build.sh [ptrace_init output]   (default: ./ptrace_init)
 #        DEBUG=1 ./build.sh               # test build: serial console +
 #                                         # verbose tracer/probe logs by default
+#        EFI_CC=<cc> ./build.sh           # EFI loader compiler (clang or a
+#                                         # PE-targeting gcc like
+#                                         # x86_64-w64-mingw32-gcc; auto)
 set -e
 ROOT=$(cd "$(dirname "$0")" && pwd)
 OUT=${1:-$ROOT/ptrace_init}
 DEBUG=${DEBUG:-0}
 case "$DEBUG" in 0|1) ;; *) echo "ERROR: DEBUG must be 0 or 1" >&2; exit 1 ;; esac
 
-# Prefer musl (tiny static binary); fall back to a multilib host gcc.
-find_cc() {
-    if [ -x "$ROOT/.toolchain/i386-musl/bin/musl-gcc" ]; then
-        echo "$ROOT/.toolchain/i386-musl/bin/musl-gcc"
-    elif [ -x "$ROOT/../MikroTikPatch/.toolchain/i386-musl/bin/musl-gcc" ]; then
-        echo "$ROOT/../MikroTikPatch/.toolchain/i386-musl/bin/musl-gcc"
-    elif printf 'int main(void){return 0;}\n' | gcc -m32 -x c - -o /dev/null 2>/dev/null; then
-        echo "gcc -m32"
-    fi
-}
-
-CC=$(find_cc)
-if [ -z "$CC" ]; then
-    echo "ERROR: no i386 toolchain found." >&2
-    echo "       Run MikroTikPatch/tools/musl_i386.sh, or install gcc-multilib." >&2
+# The i386 binary is always built against musl (tiny static binary).  If the
+# local toolchain is missing, build.sh runs tools/musl_i386.sh itself.
+CC=$ROOT/.toolchain/i386-musl/bin/musl-gcc
+if [ ! -x "$CC" ]; then
+    echo "== i486 musl toolchain missing, running tools/musl_i386.sh"
+    "$ROOT/tools/musl_i386.sh"
+fi
+if [ ! -x "$CC" ]; then
+    echo "ERROR: tools/musl_i386.sh did not install $CC" >&2
     exit 1
 fi
 
@@ -38,13 +35,12 @@ fi
 #
 #    The probe carries the embedded keygen (keygen.c, included by preload.c)
 #    and patches the licence public key in mode/keyman, to the key pair in
-#    keys.env: $ROOT/keys.env when present, otherwise MikroTikPatch's next to
-#    this repo.  The key pair can be overridden with
+#    $ROOT/keys.env when present (gitignored; see keys.env.example).  The
+#    key pair can be overridden with
 #    CUSTOM_LICENSE_PUBLIC_KEY / CUSTOM_LICENSE_PRIVATE_KEY, the stock key
 #    with MIKRO_LICENSE_PUBLIC_KEY; when nothing is set the defaults baked
 #    into keygen.c / preload.c are used.
 KEYS_ENV=${KEYS_ENV:-$ROOT/keys.env}
-[ -f "$KEYS_ENV" ] || KEYS_ENV=$ROOT/../MikroTikPatch/keys.env
 if [ -f "$KEYS_ENV" ]; then
     [ -n "${CUSTOM_LICENSE_PUBLIC_KEY:-}" ] || CUSTOM_LICENSE_PUBLIC_KEY=$(sed -n 's/^CUSTOM_LICENSE_PUBLIC_KEY=//p' "$KEYS_ENV" | head -n1)
     [ -n "${CUSTOM_LICENSE_PRIVATE_KEY:-}" ] || CUSTOM_LICENSE_PRIVATE_KEY=$(sed -n 's/^CUSTOM_LICENSE_PRIVATE_KEY=//p' "$KEYS_ENV" | head -n1)
@@ -56,6 +52,7 @@ DEFS="-DBOOTKIT_DEBUG_DEFAULT=$DEBUG"
 [ -n "${CUSTOM_LICENSE_PRIVATE_KEY:-}" ] && DEFS="$DEFS -DKEYGEN_LICENSE_PRIVATE_HEX=\"$CUSTOM_LICENSE_PRIVATE_KEY\""
 [ -n "${MIKRO_LICENSE_PUBLIC_KEY:-}" ] && DEFS="$DEFS -DSTOCK_LICENSE_PUBLIC_HEX=\"$MIKRO_LICENSE_PUBLIC_KEY\""
 echo "== build: DEBUG=$DEBUG (1 = serial console + verbose tracer/probe logs)"
+echo "== i386 compiler: $CC"
 echo "== probe keys: custom ${CUSTOM_LICENSE_PUBLIC_KEY:-<keygen.c default>}, stock ${MIKRO_LICENSE_PUBLIC_KEY:-<built-in default>}"
 
 # shellcheck disable=SC2086
@@ -105,22 +102,61 @@ PY
 echo "built: $ROOT/initrd.cpio ($(wc -c < "$ROOT/initrd.cpio") bytes), embedded in the loader"
 
 # 5. the EFI loader (installed as \EFI\BOOT\BOOTKIT.EFI; replaces the EFI shell
-#    + startup.nsh trick).  Freestanding x86_64 PE32+ built with clang/lld-link,
-#    no libc and no gnu-efi; the initramfs is embedded (initrd_so.h, step 4).
-if ! command -v clang >/dev/null 2>&1; then
-    echo "ERROR: clang not found (needed to build bootkit.efi)." >&2
+#    + startup.nsh trick).  Freestanding x86_64 PE32+ with the initramfs
+#    embedded (initrd_so.h, step 4), no libc and no gnu-efi.
+#
+#    Prefer clang + lld-link (--target=x86_64-unknown-windows); a gcc that
+#    targets PE, e.g. x86_64-w64-mingw32-gcc, works equally well.  Force one
+#    with EFI_CC=<compiler>.
+EFI_CC=${EFI_CC:-auto}
+if [ "$EFI_CC" = auto ]; then
+    if command -v clang >/dev/null 2>&1 && command -v lld-link >/dev/null 2>&1; then
+        EFI_CC=clang
+    elif command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+        EFI_CC=x86_64-w64-mingw32-gcc
+    fi
+fi
+if [ -z "$EFI_CC" ] || [ "$EFI_CC" = auto ]; then
+    echo "ERROR: no EFI compiler found (need clang + lld-link, or" >&2
+    echo "       x86_64-w64-mingw32-gcc; override with EFI_CC=...)." >&2
     exit 1
 fi
-clang --target=x86_64-unknown-windows -ffreestanding -fno-stack-protector \
-    -mno-red-zone -mno-sse -fshort-wchar -Os -Wall -Wextra -nostdlib \
-    -DBOOTKIT_DEBUG_DEFAULT="$DEBUG" \
-    -fuse-ld=lld-link \
-    -Wl,/subsystem:efi_application,/entry:efi_main,/nodefaultlib \
-    -o "$ROOT/bootkit.efi" \
-    "$ROOT/bootloader/efi_main.c" "$ROOT/bootloader/efi.c" \
-    "$ROOT/bootloader/boot.c" "$ROOT/bootloader/config.c" \
-    "$ROOT/bootloader/vars.c" "$ROOT/bootloader/installer.c"
-echo "built: $ROOT/bootkit.efi ($(wc -c < "$ROOT/bootkit.efi") bytes)"
+
+LOADER_SRCS="efi_main efi boot config vars installer"
+EFI_OBJ=$(mktemp -d)
+trap 'rm -rf "$INITRD_TMP" "$EFI_OBJ"' EXIT
+case "$EFI_CC" in
+    *clang*)
+        clang --target=x86_64-unknown-windows -ffreestanding -fno-stack-protector \
+            -mno-red-zone -mno-sse -fshort-wchar -Os -Wall -Wextra -nostdlib \
+            -DBOOTKIT_DEBUG_DEFAULT="$DEBUG" \
+            -fuse-ld=lld-link \
+            -Wl,/subsystem:efi_application,/entry:efi_main,/nodefaultlib \
+            -o "$ROOT/bootkit.efi" \
+            "$ROOT/bootloader/efi_main.c" "$ROOT/bootloader/efi.c" \
+            "$ROOT/bootloader/boot.c" "$ROOT/bootloader/config.c" \
+            "$ROOT/bootloader/vars.c" "$ROOT/bootloader/installer.c"
+        ;;
+    *)
+        if ! $EFI_CC -dumpmachine 2>/dev/null | grep -q mingw; then
+            echo "ERROR: $EFI_CC does not target PE/Windows; use clang" >&2
+            echo "       (--target=x86_64-unknown-windows) or" >&2
+            echo "       x86_64-w64-mingw32-gcc." >&2
+            exit 1
+        fi
+        for s in $LOADER_SRCS; do
+            $EFI_CC -c -ffreestanding -fshort-wchar -fno-stack-protector \
+                -mno-red-zone -mno-sse -fno-asynchronous-unwind-tables \
+                -Os -Wall -Wextra -DBOOTKIT_DEBUG_DEFAULT="$DEBUG" \
+                -I "$ROOT/bootloader" \
+                -o "$EFI_OBJ/$s.o" "$ROOT/bootloader/$s.c"
+        done
+        $EFI_CC -nostdlib -Wl,--subsystem,10 -Wl,-e,efi_main \
+            -Wl,--no-insert-timestamp \
+            -o "$ROOT/bootkit.efi" "$EFI_OBJ"/*.o
+        ;;
+esac
+echo "built: $ROOT/bootkit.efi ($(wc -c < "$ROOT/bootkit.efi") bytes, via $EFI_CC)"
 
 # 6. bootkit.img: the installer/removable USB stick, a 32 MB MBR disk with one
 #    EFI system partition (FAT, type 0xEF) holding \EFI\BOOT\BOOTX64.EFI.  Flash

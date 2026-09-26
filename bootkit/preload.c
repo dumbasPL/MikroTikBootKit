@@ -14,8 +14,8 @@
  * the constructor also logs one line per process loaded, naming the
  * executable and its pid.  On top of that:
  *
- *   /nova/bin/mode    the embedded keygen (keygen.c, an embeddable copy of
- *                     MikroTikPatch's) generates and signs the licence blob
+ *   /nova/bin/mode    the embedded keygen (keygen.c) generates and signs the
+ *                     licence blob
  *                     with the custom key pair, and the licence public key
  *                     the stock verifier builds on the stack is replaced in
  *                     memory, so mode accepts the licence and raises the
@@ -29,25 +29,25 @@
  *                     text and key material are left untouched.
  *   everything else   nothing (debug=1: only the console line)
  *
- * The in-memory patch is the runtime equivalent of MikroTikPatch's
- * ReplaceKeyArch(): the x86 binaries store the 32-byte public key as eight
+ * The in-memory patch is the runtime equivalent of the key replacement the
+ * reference patch does to the binaries: the x86 binaries store the 32-byte public key as eight
  * `mov dword [ebp-x], imm32` immediates in .text (up to 6 bytes between the
  * 4-byte chunks).  The chunks are replaced in place and the bytes of the
  * instructions in between are left alone.  The affected pages are made
  * writable for the patch and restored to r-x afterwards; only the private
  * (COW) text mapping is touched, so the file on disk is untouched.
  *
- * The key material comes from keys.env (see build.sh; the local one or
- * MikroTikPatch's): the same custom pair the reference build bakes into its
- * images, so the licence this probe signs verifies against the key it patches
- * in.  Build by build.sh into preload.so; embedded in ptrace_init.
+ * The key material comes from keys.env (see build.sh and keys.env.example);
+ * signing and patching use the same pair, so the licence this probe signs
+ * verifies against the key it patches in.  Build by build.sh into preload.so;
+ * embedded in ptrace_init.
  */
 
 #define _GNU_SOURCE
 
 /*
- * The embedded keygen: keygen.c is a copy of MikroTikPatch's standalone
- * keygen.c trimmed to the generation role (no CLI, no mode2 hand-over, no
+ * The embedded keygen: keygen.c is the standalone RouterOS keygen trimmed to
+ * the generation role (no CLI, no mode2 hand-over, no
  * exit()); its kg_generate()/kg_error() are called below.  The licence key
  * pair is selected with -DKEYGEN_LICENSE_PUBLIC_HEX /
  * -DKEYGEN_LICENSE_PRIVATE_HEX (see build.sh).
@@ -80,7 +80,7 @@ static int verbose_log(void)
 }
 
 /* The stock RouterOS licence public key, as MIKRO_LICENSE_PUBLIC_KEY in
- * MikroTikPatch's keys.env; build.sh overrides it when the file is present. */
+ * keys.env; build.sh overrides it when the file is present. */
 #ifndef STOCK_LICENSE_PUBLIC_HEX
 #define STOCK_LICENSE_PUBLIC_HEX \
 	"8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32"
@@ -116,8 +116,8 @@ static void console_log(const char *fmt, ...)
 /* ------------------------------------------------------- in-memory key patch */
 
 /* Match chunks idx..7 of oldk in buf at offsets >= after, with at most
- * KEY_GAP_MAX bytes between consecutive chunks (same greedy search as
- * MikroTikPatch's matchGreedy).  ends[] receives the offset of each chunk;
+ * KEY_GAP_MAX bytes between consecutive chunks (the same greedy search the
+ * reference key patcher uses).  ends[] receives the offset of each chunk;
  * returns the end offset of the last chunk, or 0 when there is no match. */
 static size_t match_key(const unsigned char *buf, size_t len, size_t after,
 			int idx, const unsigned char *oldk, size_t *ends)

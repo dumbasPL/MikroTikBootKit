@@ -53,7 +53,7 @@ Boot-time tooling for MikroTik RouterOS images.  Two pieces:
   dynamically linked binary started after the mount (`sysinit`, `mode`,
   `loader`, all services) loads it and its constructor logs the binary's name
   to `/dev/console`.  On top of the logging the probe carries the embedded
-  keygen (`keygen.c`, adapted from MikroTikPatch's): in `/nova/bin/mode` it
+  keygen (`keygen.c`): in `/nova/bin/mode` it
   signs and installs the licence with the custom key pair, and in `mode` and
   `keyman` it replaces the licence public key the stock verifier builds on its
   stack.  Nothing in the RouterOS image is modified on disk.
@@ -68,7 +68,7 @@ bootkit/                    the RouterOS-side initramfs kit
   ptrace_init.c             alternative init that drops the probe (static i386)
   preload.c                 LD_PRELOAD probe: console log, in-memory key patch,
                             embedded keygen glue
-  keygen.c                  embeddable licence keygen (adapted from MikroTikPatch)
+  keygen.c                  embeddable licence keygen (Curve25519 EC-KCDSA)
 bootloader/                 the EFI-side loader (-> \EFI\BOOT\BOOTKIT.EFI)
   efi_main.c                entry point: config -> boot, otherwise install menu
   efi.[ch]                  minimal EFI subset: types, console, files, paths
@@ -77,6 +77,10 @@ bootloader/                 the EFI-side loader (-> \EFI\BOOT\BOOTKIT.EFI)
   config.[ch]               \BOOTKIT.CFG: target ESP identity, read/write/find
   vars.c                    Boot#### creation and BootOrder update
   installer.c               install menu (direct / removable)
+tools/musl_i386.sh          builds the local i486-musl toolchain (downloads
+                            and compiles musl; picked up by build.sh)
+keys.env.example            licence key material template (keys.env is
+                            gitignored)
 build.sh                    builds the bootkit, the bootloader and bootkit.img
 vmtest.sh                   prepare/install/boot/interact with a test image copy
 vmconsole.py                serial-console helper used by vmtest.sh cmd and the
@@ -109,9 +113,14 @@ loader starts its direct/removable install menu; a removable install writes
 the config to the same FAT partition, after which the stick can boot RouterOS
 without touching the router's NVRAM.
 
-The EFI loader is built by the same script with clang/lld-link; it defines the
-small EFI subset it needs itself (`-nostdlib`, no gnu-efi), so apart from the
-usual build tools (`python3`, `cpio`, `mtools`) only clang and lld are needed.
+The EFI loader is built by the same script; it defines the small EFI subset it
+needs itself (`-nostdlib`, no gnu-efi), so apart from the usual build tools
+(`python3`, `cpio`, `mtools`) only an EFI-capable compiler is needed: clang +
+lld-link (preferred), or a gcc that targets PE such as
+`x86_64-w64-mingw32-gcc` (`EFI_CC=x86_64-w64-mingw32-gcc ./build.sh`; the
+script picks it automatically when clang is missing).  Native Linux gcc cannot
+produce the relocatable PE by itself - that needs a PE linker or gnu-efi's
+self-relocator.
 The script packs the freshly built `ptrace_init` into a cpio (`initrd.cpio`,
 embedded via the generated `bootloader/initrd_so.h`), so `bootkit.efi` is
 self-contained: only the stock kernel sits next to it on the ESP, plus the
@@ -123,23 +132,25 @@ The LD_PRELOAD probe (bootkit/preload.c) is ordinary C linked without libc
 (-nostdlib): no DT_NEEDED entry, the imports are bound at load time by the
 dynamic linker against the libc already in the process (RouterOS /lib/libc.so).
 
-The licence tooling is built in: `keygen.c` is a copy of MikroTikPatch's
-keygen trimmed to the generation role (no CLI, no mode2 hand-over, no
-`exit()`, clean `kg_generate()`/`kg_error()` API) and is `#include`d by
-`preload.c`.  The key material is baked in at build time from `keys.env`
-(`$ROOT/keys.env` when present, otherwise `MikroTikPatch/keys.env`):
+The licence tooling is built in: `keygen.c` is the standalone RouterOS keygen
+trimmed to the generation role (no CLI, no mode2 hand-over, no `exit()`,
+clean `kg_generate()`/`kg_error()` API) and is `#include`d by `preload.c`.
+The key material is baked in at build time from `$ROOT/keys.env` when that
+file exists (gitignored; `keys.env.example` lists the variables):
 `CUSTOM_LICENSE_PUBLIC_KEY` / `CUSTOM_LICENSE_PRIVATE_KEY`, stock key
-`MIKRO_LICENSE_PUBLIC_KEY`; both are overridable via environment / `KEYS_ENV`,
-and `/keys.env` is gitignored.
+`MIKRO_LICENSE_PUBLIC_KEY`; all are overridable via environment / `KEYS_ENV`,
+and without the file the defaults baked into `keygen.c` / `preload.c` are
+used.
 
-It uses, in order: a local `.toolchain/i386-musl`, MikroTikPatch's
-`.toolchain/i386-musl` (create it with `MikroTikPatch/tools/musl_i386.sh`), or
-a multilib host `gcc -m32`.  The binary is static, so it runs in the
-initramfs with no libraries.
+The i386 binary is always built against musl: `build.sh` uses the local
+`.toolchain/i386-musl`, and if that is missing it runs `tools/musl_i386.sh`
+itself (which needs a multilib host gcc -m32 and network access to fetch
+musl).  The binary is static, so it runs in the initramfs with no libraries.
 
 ## Test
 
-Needs: KVM (`-enable-kvm` is mandatory), `clang` + `lld`, `edk2-ovmf`,
+Needs: KVM (`-enable-kvm` is mandatory), `clang` + `lld` (or
+`x86_64-w64-mingw32-gcc`), `edk2-ovmf`,
 `mtools` (`mformat`/`mmd`/`mcopy` also build `bootkit.img`), `cpio`, and a
 RouterOS x86 image.  Use a *copy* of the image; the ESP (partition 1) is
 rewritten.  Always kill the VM by pidfile when done — do not leave QEMU

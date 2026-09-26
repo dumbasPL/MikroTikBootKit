@@ -1,12 +1,11 @@
 #!/bin/sh
-# Build ptrace_init: a small static i386 binary used as an alternative
-# initramfs init that drops an LD_PRELOAD probe into /ram once the stock init
-# has mounted the tmpfs there (via ptrace, see ptrace_init.c).
+# Build the boot kit:
 #
-# Usage: ./build.sh [output]          (default: ./ptrace_init)
+#   bootkit/     ptrace_init (the alternative initramfs init) and the
+#                LD_PRELOAD probe it drops (preload.c, keygen.c)
+#   bootloader/  the EFI loader (efiboot -> bootkit.efi, USB image bootkit.img)
 #
-# Also builds preload.so (the LD_PRELOAD probe, see preload.c) and embeds it
-# into the init binary as a C array (preload_so.h).
+# Usage: ./build.sh [ptrace_init output]   (default: ./ptrace_init)
 set -e
 ROOT=$(cd "$(dirname "$0")" && pwd)
 OUT=${1:-$ROOT/ptrace_init}
@@ -57,10 +56,10 @@ echo "== probe keys: custom ${CUSTOM_LICENSE_PUBLIC_KEY:-<keygen.c default>}, st
 # shellcheck disable=SC2086
 $CC -shared -fPIC -nostdlib -Os -fno-stack-protector -fvisibility=hidden \
     -ffunction-sections -fdata-sections -Wl,--gc-sections \
-    $DEFS -o "$ROOT/preload.so" "$ROOT/preload.c"
+    $DEFS -o "$ROOT/bootkit/preload.so" "$ROOT/bootkit/preload.c"
 
 # 2. embed preload.so into the init binary
-python3 - "$ROOT/preload.so" "$ROOT/preload_so.h" <<'PY'
+python3 - "$ROOT/bootkit/preload.so" "$ROOT/bootkit/preload_so.h" <<'PY'
 import sys
 data = open(sys.argv[1], 'rb').read()
 with open(sys.argv[2], 'w') as f:
@@ -74,8 +73,8 @@ PY
 
 # 3. ptrace_init itself
 # shellcheck disable=SC2086
-$CC -static -Os -Wall -o "$OUT" "$ROOT/ptrace_init.c"
-echo "built: $OUT ($(wc -c < "$OUT") bytes), preload.so ($(wc -c < "$ROOT/preload.so") bytes)"
+$CC -static -Os -Wall -o "$OUT" "$ROOT/bootkit/ptrace_init.c"
+echo "built: $OUT ($(wc -c < "$OUT") bytes), preload.so ($(wc -c < "$ROOT/bootkit/preload.so") bytes)"
 
 # 4. the initramfs (the just-built ptrace_init alone, cpio/newc) and its
 #    embedded C array for the EFI loader.
@@ -87,7 +86,7 @@ INITRD_TMP=$(mktemp -d)
 trap 'rm -rf "$INITRD_TMP"' EXIT
 cp "$OUT" "$INITRD_TMP/ptrace_init"
 (cd "$INITRD_TMP" && find ptrace_init | cpio -o -H newc --owner=0:0 2>/dev/null) > "$ROOT/initrd.cpio"
-python3 - "$ROOT/initrd.cpio" "$ROOT/initrd_so.h" <<'PY'
+python3 - "$ROOT/initrd.cpio" "$ROOT/bootloader/initrd_so.h" <<'PY'
 import sys
 data = open(sys.argv[1], 'rb').read()
 with open(sys.argv[2], 'w') as f:
@@ -111,7 +110,10 @@ clang --target=x86_64-unknown-windows -ffreestanding -fno-stack-protector \
     -mno-red-zone -mno-sse -fshort-wchar -Os -Wall -Wextra -nostdlib \
     -fuse-ld=lld-link \
     -Wl,/subsystem:efi_application,/entry:efi_main,/nodefaultlib \
-    -o "$ROOT/bootkit.efi" "$ROOT/efiboot.c"
+    -o "$ROOT/bootkit.efi" \
+    "$ROOT/bootloader/efi_main.c" "$ROOT/bootloader/efi.c" \
+    "$ROOT/bootloader/boot.c" "$ROOT/bootloader/config.c" \
+    "$ROOT/bootloader/vars.c" "$ROOT/bootloader/installer.c"
 echo "built: $ROOT/bootkit.efi ($(wc -c < "$ROOT/bootkit.efi") bytes)"
 
 # 6. bootkit.img: the installer/removable USB stick, a 32 MB MBR disk with one

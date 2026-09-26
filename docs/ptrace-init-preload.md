@@ -26,7 +26,7 @@ stub (the reference tool's trick) so the loader's verifier accepts the custom
 signature.  See
 [Runtime licence: keygen + key patches](#runtime-licence-keygen--key-patches).
 
-Source: `ptrace_init.c` (build: `./build.sh`).  Part of MikroTikBootKit.
+Source: `bootkit/ptrace_init.c` (build: `./build.sh`).  Part of MikroTikBootKit.
 
 ## How it works
 
@@ -50,7 +50,7 @@ probe is placed there: it is reachable as `/ram/ldpreload.so` by every
 service, and the bind keeps the rootfs backing that makes it mappable on
 7.24.4.
 
-The probe (`preload.c`) is a plain i386 shared object built without libc
+The probe (`bootkit/preload.c`) is a plain i386 shared object built without libc
 (`-nostdlib`): no `DT_NEEDED`, the imports (`open`/`write`/`readlink`/
 `getpid`/`snprintf`/...) are resolved at load time by the dynamic linker
 against the libc already in the process (RouterOS `/lib/libc.so`).  `build.sh`
@@ -136,7 +136,7 @@ Build:
 
 ```sh
 ./build.sh                        # -> ptrace_init (static i386)
-                                  #    bootkit.efi (EFI loader, see efiboot.c)
+                                  #    bootkit.efi (EFI loader, see bootloader/)
                                   #    bootkit.img (32 MB USB stick image)
 ```
 
@@ -156,7 +156,7 @@ system partition (p1 starts at LBA 0x800, so `mtools` addresses it as
 `image@@1048576`):
 
 ```
-/EFI/BOOT/BOOTKIT.EFI   = bootkit EFI loader (efiboot.c -> bootkit.efi),
+/EFI/BOOT/BOOTKIT.EFI   = bootkit EFI loader (bootloader/ -> bootkit.efi),
                           with the /ptrace_init cpio embedded; written and
                           given its Boot#### entry by the loader's installer
                           (direct install)
@@ -171,7 +171,7 @@ The loader copies the embedded cpio below 4 GB, fills in `struct boot_params`
 handover entry.  The entry point is the kernel's own EFI stub, which relocates
 the kernel, exits boot services and jumps into the decompressor - so the
 kernel still sees a full EFI environment.  Earlier the ESP ran an EFI shell +
-`startup.nsh` instead; `efiboot.c` replaced that (the log below is unchanged
+`startup.nsh` instead; the EFI loader replaced that (the log below is unchanged
 by it), and the stock kernel used to be renamed to `KERNEL.EFI` because the
 loader had to be `BOOTX64.EFI`.  With the loader under its own name the kernel
 file is never touched.
@@ -219,7 +219,7 @@ for the `[ptrace-init]` and `[ldpreload]` lines and for `CHR Login:`.  To see
 the install menu again, delete `\BOOTKIT.CFG` or start the loader with
 `--install`.
 
-The paths are compile-time constants at the top of `ptrace_init.c`
+The paths are compile-time constants at the top of `bootkit/ptrace_init.c`
 (`REAL_INIT`, `PRELOAD_PATH`); the mount strings the tracer matches
 (`/newroot`, `/ram`, `tmpfs`) are stock-init behaviour - re-check them when
 moving to another RouterOS version.

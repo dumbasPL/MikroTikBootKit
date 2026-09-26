@@ -2,7 +2,7 @@
 
 Boot-time tooling for MikroTik RouterOS images.  Two pieces:
 
-* **`efiboot.c`** — a small self-contained EFI bootloader, installed as
+* **`bootloader/`** — the EFI side: a small self-contained EFI bootloader, installed as
   `\EFI\BOOT\BOOTKIT.EFI` and reached through a `Boot####` entry.  It replaces
   the EFI shell + `startup.nsh` trick the kit used before: it reads the stock
   kernel from `\EFI\BOOT\BOOTX64.EFI` (left in place there, so a RouterOS
@@ -36,10 +36,11 @@ Boot-time tooling for MikroTik RouterOS images.  Two pieces:
   Both end with "press any key to reboot".  `--install` in the load options
   forces the menu even when a valid config exists.
 
-* **`ptrace_init.c`** — an alternative initramfs init (`rdinit=/ptrace_init`)
-  that ptrace-attaches to the real init and waits for it to mount the tmpfs on
-  `/ram`.  As soon as the mount succeeds the tracer writes an embedded
-  `LD_PRELOAD` probe to `/ram/ldpreload.so`, detaches the init and exits.
+* **`bootkit/`** — an alternative initramfs init (`rdinit=/ptrace_init`)
+  (`bootkit/ptrace_init.c`) that ptrace-attaches to the real init and waits
+  for it to mount the tmpfs on `/ram`.  As soon as the mount succeeds the
+  tracer writes an embedded `LD_PRELOAD` probe to `/ram/ldpreload.so`,
+  detaches the init and exits.
   The probe is put into the environment before `/init` is exec'd, so every
   dynamically linked binary started after the mount (`sysinit`, `mode`,
   `loader`, all services) loads it and its constructor logs the binary's name
@@ -55,16 +56,20 @@ Design notes, the target behaviours it relies on and the observed boot log:
 ## Layout
 
 ```
-efiboot.c                   EFI loader + installer (-> \EFI\BOOT\BOOTKIT.EFI):
-                            reads \BOOTKIT.CFG, finds the RouterOS ESP by its
-                            HD() identity, boots \EFI\BOOT\BOOTX64.EFI from it
-                            with the embedded initramfs; without a valid
-                            config it offers a direct/removable install menu
-ptrace_init.c               the tool (static i386)
-preload.c                   LD_PRELOAD probe: console log, in-memory key patch,
+bootkit/                    the RouterOS-side initramfs kit
+  ptrace_init.c             alternative init that drops the probe (static i386)
+  preload.c                 LD_PRELOAD probe: console log, in-memory key patch,
                             embedded keygen glue
-keygen.c                    embeddable licence keygen (adapted from MikroTikPatch)
-build.sh                    builds + embeds the probe, then the tool and the loader
+  keygen.c                  embeddable licence keygen (adapted from MikroTikPatch)
+bootloader/                 the EFI-side loader (-> \EFI\BOOT\BOOTKIT.EFI)
+  efi_main.c                entry point: config -> boot, otherwise install menu
+  efi.[ch]                  minimal EFI subset: types, console, files, paths
+  bootabi.h                 x86 boot protocol structs (setup header, boot_params)
+  boot.c                    loads \EFI\BOOT\BOOTX64.EFI and EFI-handovers into it
+  config.[ch]               \BOOTKIT.CFG: target ESP identity, read/write/find
+  vars.c                    Boot#### creation and BootOrder update
+  installer.c               install menu (direct / removable)
+build.sh                    builds the bootkit, the bootloader and bootkit.img
 vmtest.sh                   prepare/install/boot/interact with a test image copy
 vmconsole.py                serial-console helper used by vmtest.sh cmd and the
                             installer driver
@@ -98,12 +103,12 @@ The EFI loader is built by the same script with clang/lld-link; it defines the
 small EFI subset it needs itself (`-nostdlib`, no gnu-efi), so apart from the
 usual build tools (`python3`, `cpio`, `mtools`) only clang and lld are needed.
 The script packs the freshly built `ptrace_init` into a cpio (`initrd.cpio`,
-embedded via the generated `initrd_so.h`), so `bootkit.efi` is self-contained:
-only the stock kernel sits next to it on the ESP, plus the `Boot####` entry
-that points at the loader.  The kernel path and command line are compile-time
-constants at the top of `efiboot.c`.
+embedded via the generated `bootloader/initrd_so.h`), so `bootkit.efi` is
+self-contained: only the stock kernel sits next to it on the ESP, plus the
+`Boot####` entry that points at the loader.  The kernel path and command line
+are compile-time constants at the top of `bootloader/boot.c`.
 
-The LD_PRELOAD probe (preload.c) is ordinary C linked without libc
+The LD_PRELOAD probe (bootkit/preload.c) is ordinary C linked without libc
 (-nostdlib): no DT_NEEDED entry, the imports are bound at load time by the
 dynamic linker against the libc already in the process (RouterOS /lib/libc.so).
 

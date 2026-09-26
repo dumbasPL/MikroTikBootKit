@@ -560,18 +560,27 @@ static void preload_init(void)
 	if (strcmp(base, "mode") == 0) {
 		int hits = patch_licence_key(exe);
 
-		console_log("[ldpreload] mode: licence key patched (%d site%s)\n",
-			    hits, hits == 1 ? "" : "s");
+		if (hits < 0)
+			console_log("[ldpreload] mode: cannot patch the licence key\n");
+		else
+			console_log("[ldpreload] mode: licence key patched (%d site%s)\n",
+				    hits, hits == 1 ? "" : "s");
 		run_embedded_keygen();
 	} else if (strcmp(base, "keyman") == 0) {
 		int hits = patch_licence_key(exe);
 
-		console_log("[ldpreload] keyman: licence key patched (%d site%s)\n",
-			    hits, hits == 1 ? "" : "s");
+		if (hits < 0)
+			console_log("[ldpreload] keyman: cannot patch the licence key\n");
+		else
+			console_log("[ldpreload] keyman: licence key patched (%d site%s)\n",
+				    hits, hits == 1 ? "" : "s");
 	} else if (strcmp(base, "loader") == 0) {
 		int hits = patch_memcmp_got(exe);
 
-		console_log("[ldpreload] loader: memcmp GOT patched (%d slot%s)\n",
-			    hits, hits == 1 ? "" : "s");
+		if (hits < 0)
+			console_log("[ldpreload] loader: cannot patch the memcmp GOT slot\n");
+		else
+			console_log("[ldpreload] loader: memcmp GOT patched (%d slot%s)\n",
+				    hits, hits == 1 ? "" : "s");
 	}
 }

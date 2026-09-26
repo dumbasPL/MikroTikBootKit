@@ -328,6 +328,7 @@ static void tracer_main(pid_t parent, int ready_fd)
 	long opts = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC;
 	int mount_armed = 0;	/* mount() entry seen, check the exit stop */
 	int root_armed = 0;	/* mount("tmpfs", "/newroot") seen */
+	int in_newroot = 0;	/* chroot followed the init into /newroot */
 
 	if (ptrace(PTRACE_SEIZE, parent, 0, (void *)opts) < 0) {
 		logerr("PTRACE_SEIZE(%d) failed: %s", (int)parent,
@@ -415,8 +416,10 @@ static void tracer_main(pid_t parent, int ready_fd)
 						    chdir("/") != 0)
 							logerr("cannot follow into /newroot: %s",
 							       strerror(errno));
-						else
+						else {
+							in_newroot = 1;
 							logmsg("following the init into /newroot");
+						}
 					}
 				}
 				if (mount_armed) {
@@ -425,6 +428,10 @@ static void tracer_main(pid_t parent, int ready_fd)
 						/* the tmpfs is live in our
 						 * namespace too - drop the probe
 						 * and let go */
+						if (!in_newroot)
+							logerr("pid %d: /ram mounted before the /newroot switch, "
+							       "the probe may be left in the old root",
+							       (int)parent);
 						finish(parent);
 						return;
 					}

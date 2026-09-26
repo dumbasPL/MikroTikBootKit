@@ -976,9 +976,11 @@ static int write_config(const u8 *data, size_t len) {
 
     fd = open(flash, O_RDONLY | O_LARGEFILE);
     if (fd >= 0) {
-        ioctl(fd, (int)IOCTL_WRITE, (void *)data);
+        /* the blob goes through the driver's write ioctl; a negative
+         * return is an error and must not count as a successful write */
+        if (ioctl(fd, (int)IOCTL_WRITE, (void *)data) >= 0)
+            ok = 1;
         close(fd);
-        ok = 1;
     }
 
     fd = open(disk, O_RDWR | O_LARGEFILE);

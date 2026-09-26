@@ -153,8 +153,9 @@ system partition (p1 starts at LBA 0x800, so `mtools` addresses it as
 
 ```
 /EFI/BOOT/BOOTKIT.EFI   = bootkit EFI loader (efiboot.c -> bootkit.efi),
-                          with the /ptrace_init cpio embedded; started by a
-                          Boot#### entry created once (bcfg / efibootmgr)
+                          with the /ptrace_init cpio embedded; written and
+                          given its Boot#### entry by the loader's own
+                          installer (or bcfg / efibootmgr)
 /EFI/BOOT/BOOTX64.EFI   = stock RouterOS kernel (EFI stub, ~4 MB), left in
                           place so RouterOS updates keep overwriting it
 ```
@@ -168,6 +169,12 @@ kernel still sees a full EFI environment.  Earlier the ESP ran an EFI shell +
 by it), and the stock kernel used to be renamed to `KERNEL.EFI` because the
 loader had to be `BOOTX64.EFI`.  With the loader under its own name the kernel
 file is never touched.
+
+When the loader is started as `\EFI\BOOT\BOOTX64.EFI` (from an installer
+stick) or with `--install`, it runs its installer instead of booting: it lists
+the EFI partitions it can see over the console, copies itself to
+`\EFI\BOOT\BOOTKIT.EFI` on the chosen one, creates a `MikroTikBootKit`
+`Boot####` entry at the front of `BootOrder` and reboots on a key press.
 
 Booting QEMU's `-kernel BOOTX64.EFI -initrd ... -append rdinit=...` was tried
 first and does not work for this image: the wrapper runs, but the stock init
@@ -190,6 +197,11 @@ qemu-system-x86_64 -m 1024 -smp 2 -cpu host -enable-kvm \
   -serial chardev:ser
 ```
 
+The one-time install run adds the installer stick as a second USB drive
+(`id=d2,serial=bk-stick`); the target's `\EFI\BOOT\BOOTX64.EFI` is moved to
+`BOOTX64.BAK` for that run only so the stick boots, and restored afterwards
+(`vmtest.sh install` does all of it).
+
 Rebuild loop: `./build.sh` (it re-packs `ptrace_init` and re-embeds it in
 `bootkit.efi`), `mcopy` `bootkit.efi` over `::/EFI/BOOT/BOOTKIT.EFI` (the boot
 entry and the kernel stay untouched), boot, then check the serial log for the
@@ -206,23 +218,23 @@ moving to another RouterOS version.
 image is never touched):
 
 ```sh
-./vmtest.sh prepare              # build, copy the image, write BOOTKIT.EFI and install the boot entry
-./vmtest.sh entry                # (re)install the Boot#### entry into vars.fd
+./vmtest.sh prepare              # build, copy the image, build the installer stick
+./vmtest.sh install              # boot stick + target and drive the installer
 ./vmtest.sh boot                 # start QEMU (background, serial on a socket)
 ./vmtest.sh wait 60              # wait for the login prompt
 ./vmtest.sh check                # show the loader + tracer + ldpreload lines
 ./vmtest.sh cmd "/system license print"   # log in (admin/admin) and run one CLI command
 ./vmtest.sh login                # attach to the serial console (Ctrl-] quits)
 ./vmtest.sh stop                 # kill the VM
-./vmtest.sh test                 # prepare + boot + wait + check
+./vmtest.sh test                 # prepare + install + boot + wait + check
 ```
 
 Environment knobs: `IMG_SRC` (source image, default
 `x86-7.24.4-clean.img`), `WORK` (scratch dir, default `/tmp/opencode/bkvm`),
-`MODE=chr|x86|keep` (override the MBR mode flag), `MEM`, `SMP`, `SHELL_EFI`
-(EFI shell binary used only for the boot entry install).  `vmconsole.py`
-is the serial helper used by `vmtest.sh cmd`: it logs in as admin/admin,
-declines the forced password change and runs the command.
+`MODE=chr|x86|keep` (override the MBR mode flag), `MEM`, `SMP`.  `vmconsole.py`
+is the serial helper used by `vmtest.sh cmd` (logs in as admin/admin, declines
+the forced password change and runs the command) and by `vmtest.sh install`
+(`--install`: picks the non-installer ESP, confirms and reboots).
 
 ## 7.24.4 denies PROT_EXEC mmaps of tmpfs files - solved with a bind mount
 

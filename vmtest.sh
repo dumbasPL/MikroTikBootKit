@@ -5,38 +5,41 @@
 # \EFI\BOOT\BOOTKIT.EFI and is reached through a Boot#### entry; the stock
 # kernel stays at \EFI\BOOT\BOOTX64.EFI so RouterOS updates can overwrite it.
 #
+# The boot entry is created by the loader's own installer: the test boots a
+# small "installer stick" (a FAT image with bootkit.efi as \EFI\BOOT\BOOTX64.EFI)
+# together with the target image, answers the installer's selection prompt over
+# the serial console, and then boots the target normally.
+#
 # The source image is never modified: everything happens on $WORK/test.img.
 #
 # Usage:
-#   ./vmtest.sh prepare [IMG]   build the bootkit, make the test image, put
-#                               bootkit.efi on its ESP and install the EFI boot
-#                               entry for it
-#   ./vmtest.sh entry           (re)install the EFI boot entry into vars.fd
-#   ./vmtest.sh boot            start QEMU in the background
+#   ./vmtest.sh prepare [IMG]   build the bootkit, make the test image and the
+#                               installer stick, start from a fresh varstore
+#   ./vmtest.sh install         boot stick + target, run the installer
+#   ./vmtest.sh boot            start QEMU in the background (target only)
 #   ./vmtest.sh wait [SECS]     wait for the login prompt in the serial log
 #   ./vmtest.sh check           show the bootkit result lines
 #   ./vmtest.sh login           attach to the serial console (Ctrl-] to quit)
 #   ./vmtest.sh cmd "<command>" log in as admin/admin and run one command
 #   ./vmtest.sh stop            stop QEMU
-#   ./vmtest.sh test            prepare + boot + wait + check
+#   ./vmtest.sh test            prepare + install + boot + wait + check
 #
 # Environment:
 #   WORK=/tmp/opencode/bkvm     scratch directory (image copy, logs, pidfile)
 #   IMG=<path>                  source image (default: x86-7.24.4-clean.img)
 #   MODE=chr|x86|keep           override the MBR mode flag (default: keep)
 #   MEM=1024  SMP=2             QEMU memory / cpus
-#   SHELL_EFI=<path>            EFI shell used only to install the boot entry
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
 WORK=${WORK:-/tmp/opencode/bkvm}
 IMG_SRC=${IMG_SRC:-$ROOT/x86-7.24.4-clean.img}
 IMG=$WORK/test.img
+STICK=$WORK/stick.img
 ESP_OFF=1048576                      # partition 1 starts at LBA 2048
 MODE=${MODE:-keep}
 MEM=${MEM:-1024}
 SMP=${SMP:-2}
-SHELL_EFI=${SHELL_EFI:-/usr/share/edk2-shell/x64/Shell.efi}
 
 SERIAL_SOCK=$WORK/serial.sock
 SERIAL_LOG=$WORK/serial.log
@@ -50,6 +53,22 @@ qemu_cmd() {
         -drive if=none,id=d1,file="$IMG",format=raw \
         -device qemu-xhci,id=usb-bus \
         -device usb-storage,bus=usb-bus.0,drive=d1,serial=test \
+        -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+        -drive if=pflash,format=raw,file="$WORK/vars.fd" \
+        -display none \
+        -chardev "socket,id=ser,path=$SERIAL_SOCK,server=on,wait=off,logfile=$SERIAL_LOG" \
+        -serial chardev:ser
+}
+
+# same, plus the installer stick as the second USB drive (target stays on USB
+# port 1 so the device path in the created boot entry stays valid later)
+qemu_cmd_install() {
+    echo qemu-system-x86_64 -m "$MEM" -smp "$SMP" -cpu host -enable-kvm \
+        -drive if=none,id=d1,file="$IMG",format=raw \
+        -drive if=none,id=d2,file="$STICK",format=raw \
+        -device qemu-xhci,id=usb-bus \
+        -device usb-storage,bus=usb-bus.0,drive=d1,serial=test \
+        -device usb-storage,bus=usb-bus.0,drive=d2,serial=bk-stick \
         -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
         -drive if=pflash,format=raw,file="$WORK/vars.fd" \
         -display none \
@@ -76,33 +95,33 @@ cmd_prepare() {
         *)    die "MODE must be chr, x86 or keep" ;;
     esac
 
-    log "== installing the bootkit on the ESP (stock BOOTX64.EFI stays in place)"
+    log "== building the installer stick ($STICK)"
     export MTOOLS_SKIP_CHECK=1
-    local esp="$IMG@@$ESP_OFF"
-    mcopy -o -i "$esp" "$ROOT/bootkit.efi" ::/EFI/BOOT/BOOTKIT.EFI
-    mdir -i "$esp" ::/ ::/EFI/BOOT | sed -n '1,3p;$p' >/dev/null
+    rm -f "$STICK"
+    dd if=/dev/zero of="$STICK" bs=1M count=2 status=none
+    mformat -i "$STICK" -v BKINSTALL ::
+    mmd -i "$STICK" ::/EFI ::/EFI/BOOT
+    mcopy -i "$STICK" "$ROOT/bootkit.efi" ::/EFI/BOOT/BOOTX64.EFI
 
-    cmd_install_entry
-    log "== ready: $IMG"
+    log "== fresh varstore (the installer creates the boot entry)"
+    rm -f "$WORK/vars.fd"
+    cp -f /usr/share/edk2/x64/OVMF_VARS.4m.fd "$WORK/vars.fd"
+    log "== ready: $IMG, $STICK"
 }
 
-# Install a Boot#### entry pointing at \EFI\BOOT\BOOTKIT.EFI into
-# $WORK/vars.fd.  This is the one-time step the loader needs; on real hardware
-# it is done with efibootmgr, bcfg or the firmware boot menu.  Here the EFI
-# shell does it: BOOTX64.EFI is temporarily swapped for the shell (which runs
-# startup.nsh with the bcfg command), and the stock kernel is restored after.
-cmd_install_entry() {
+# Boot the installer stick together with the target and drive the installer
+# over the serial console.  The target's kernel is moved aside for the run so
+# the stick is the only bootable medium; it is restored afterwards.
+cmd_install() {
     [ -f "$IMG" ] || die "no test image, run: $0 prepare"
-    [ -f "$SHELL_EFI" ] || die "EFI shell not found: $SHELL_EFI (set SHELL_EFI)"
-    local esp="$IMG@@$ESP_OFF" t0
+    [ -f "$STICK" ] || die "no installer stick, run: $0 prepare"
+    local esp="$IMG@@$ESP_OFF"
 
-    mkdir -p "$WORK"
-    log "== installing the EFI boot entry (bcfg in the EFI shell)"
     export MTOOLS_SKIP_CHECK=1
-    mcopy -o -i "$esp" ::/EFI/BOOT/BOOTX64.EFI "$WORK/stock-bootx64.efi"
-    mcopy -o -i "$esp" "$SHELL_EFI" ::/EFI/BOOT/BOOTX64.EFI
-    printf 'bcfg boot add 0 fs0:\\EFI\\BOOT\\BOOTKIT.EFI "MikroTikBootKit"\r\n' > "$WORK/startup.nsh"
-    mcopy -o -i "$esp" "$WORK/startup.nsh" ::/startup.nsh
+    log "== running the installer"
+    mcopy -o -i "$esp" ::/EFI/BOOT/BOOTX64.EFI "$WORK/kernel.bak"
+    mcopy -o -i "$esp" "$WORK/kernel.bak" ::/EFI/BOOT/BOOTX64.BAK
+    mdel -i "$esp" ::/EFI/BOOT/BOOTX64.EFI
 
     stop_qemu
     rm -f "$WORK/vars.fd"
@@ -110,27 +129,19 @@ cmd_install_entry() {
     : > "$SERIAL_LOG"
     rm -f "$SERIAL_SOCK"
     # shellcheck disable=SC2046
-    $(qemu_cmd) -daemonize -pidfile "$PIDFILE"
-    t0=$(date +%s)
-    while [ $(( $(date +%s) - t0 )) -lt 40 ]; do
-        grep -aq 'Shell>' "$SERIAL_LOG" 2>/dev/null && break
-        sleep 0.5
-    done
-    sleep 2                          # let bcfg flush the variable to pflash
+    $(qemu_cmd_install) -daemonize -pidfile "$PIDFILE"
+
+    if ! python3 "$ROOT/vmconsole.py" "$SERIAL_SOCK" --install; then
+        log "== installer failed, restoring the kernel"
+        mcopy -o -i "$esp" "$WORK/kernel.bak" ::/EFI/BOOT/BOOTX64.EFI
+        mdel -i "$esp" ::/EFI/BOOT/BOOTX64.BAK 2>/dev/null || true
+        die "installer did not complete"
+    fi
     stop_qemu
 
-    mcopy -o -i "$esp" "$WORK/stock-bootx64.efi" ::/EFI/BOOT/BOOTX64.EFI
-    mdel -i "$esp" ::/startup.nsh 2>/dev/null || true
-
-    if ! python3 - "$WORK/vars.fd" <<'PY'
-import sys
-data = open(sys.argv[1], 'rb').read()
-sys.exit(0 if 'BOOTKIT.EFI'.encode('utf-16-le') in data else 1)
-PY
-    then
-        die "boot entry installation failed (BOOTKIT.EFI not in vars.fd)"
-    fi
-    log "== boot entry installed: Boot#### -> \\EFI\\BOOT\\BOOTKIT.EFI"
+    mcopy -o -i "$esp" "$WORK/kernel.bak" ::/EFI/BOOT/BOOTX64.EFI
+    mdel -i "$esp" ::/EFI/BOOT/BOOTX64.BAK 2>/dev/null || true
+    log "== installed: \\EFI\\BOOT\\BOOTKIT.EFI + boot entry in vars.fd"
 }
 
 cmd_boot() {
@@ -138,7 +149,7 @@ cmd_boot() {
     stop_qemu
     if [ ! -f "$WORK/vars.fd" ]; then
         cp -f /usr/share/edk2/x64/OVMF_VARS.4m.fd "$WORK/vars.fd"
-        log "== fresh varstore (no boot entry; run: $0 entry)"
+        log "== fresh varstore (no boot entry; run: $0 install)"
     fi
     : > "$SERIAL_LOG"
     rm -f "$SERIAL_SOCK"
@@ -200,6 +211,7 @@ cmd_cmd() {
 
 cmd_test() {
     cmd_prepare
+    cmd_install
     cmd_boot
     cmd_wait 90 || true
     cmd_check
@@ -207,7 +219,7 @@ cmd_test() {
 
 case "${1:-}" in
     prepare) shift; cmd_prepare "$@" ;;
-    entry)   cmd_install_entry ;;
+    install) cmd_install ;;
     boot)    cmd_boot ;;
     wait)    shift; cmd_wait "$@" ;;
     check)   cmd_check ;;
@@ -215,5 +227,5 @@ case "${1:-}" in
     cmd)     shift; cmd_cmd "$@" ;;
     stop)    cmd_stop ;;
     test)    cmd_test ;;
-    *)       sed -n '2,34p' "$0"; exit 1 ;;
+    *)       sed -n '2,40p' "$0"; exit 1 ;;
 esac

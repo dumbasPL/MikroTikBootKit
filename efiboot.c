@@ -46,6 +46,9 @@ typedef UINT16			CHAR16;
 typedef UINT8			BOOLEAN;
 typedef void			VOID;
 
+#define TRUE 1
+#define FALSE 0
+
 #define EFIAPI __attribute__((ms_abi))
 #define EFI_PAGE_SIZE 4096
 #define EFI_SIZE_TO_PAGES(n) (((n) + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE)
@@ -66,6 +69,19 @@ typedef UINTN EFI_TPL;
 #define EFI_DEVICE_ERROR	(7ULL | (1ULL << 63))
 #define EFI_OUT_OF_RESOURCES	(9ULL | (1ULL << 63))
 #define EFI_NOT_FOUND		(14ULL | (1ULL << 63))
+#define EFI_ABORTED		(21ULL | (1ULL << 63))
+
+#define EFI_FILE_MODE_READ	0x0000000000000001ULL
+#define EFI_FILE_MODE_WRITE	0x0000000000000002ULL
+#define EFI_FILE_MODE_CREATE	0x8000000000000000ULL
+#define EFI_FILE_DIRECTORY	0x0000000000000010ULL
+
+#define EFI_VARIABLE_NON_VOLATILE	0x00000001
+#define EFI_VARIABLE_BOOTSERVICE_ACCESS	0x00000002
+#define EFI_VARIABLE_RUNTIME_ACCESS	0x00000004
+#define EFI_LOAD_OPTION_ACTIVE		0x00000001
+
+#define EfiResetCold		0
 
 typedef enum {
 	AllocateAnyPages = 0,
@@ -113,6 +129,37 @@ struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL {
 	VOID *Mode;
 };
 
+typedef struct {
+	UINT16 ScanCode;
+	CHAR16 UnicodeChar;
+} EFI_INPUT_KEY;
+
+typedef struct EFI_SIMPLE_TEXT_INPUT_PROTOCOL EFI_SIMPLE_TEXT_INPUT_PROTOCOL;
+struct EFI_SIMPLE_TEXT_INPUT_PROTOCOL {
+	EFI_STATUS (EFIAPI *Reset)(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *, BOOLEAN);
+	EFI_STATUS (EFIAPI *ReadKeyStroke)(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *, EFI_INPUT_KEY *);
+	EFI_EVENT WaitForKey;
+};
+
+typedef struct EFI_RUNTIME_SERVICES EFI_RUNTIME_SERVICES;
+struct EFI_RUNTIME_SERVICES {
+	EFI_TABLE_HEADER Hdr;
+	VOID *GetTime;
+	VOID *SetTime;
+	VOID *GetWakeupTime;
+	VOID *SetWakeupTime;
+	VOID *SetVirtualAddressMap;
+	VOID *ConvertPointer;
+	EFI_STATUS (EFIAPI *GetVariable)(CHAR16 *, EFI_GUID *, UINT32 *, UINTN *, VOID *);
+	EFI_STATUS (EFIAPI *GetNextVariableName)(UINTN *, CHAR16 *, EFI_GUID *);
+	EFI_STATUS (EFIAPI *SetVariable)(CHAR16 *, EFI_GUID *, UINT32, UINTN, VOID *);
+	VOID *GetNextHighMonotonicCount;
+	VOID (EFIAPI *ResetSystem)(UINT32, EFI_STATUS, UINTN, VOID *);
+	VOID *UpdateCapsule;
+	VOID *QueryCapsuleCapabilities;
+	VOID *QueryVariableInfo;
+};
+
 typedef struct EFI_BOOT_SERVICES EFI_BOOT_SERVICES;
 struct EFI_BOOT_SERVICES {
 	EFI_TABLE_HEADER Hdr;
@@ -153,8 +200,8 @@ struct EFI_BOOT_SERVICES {
 	VOID *CloseProtocol;
 	VOID *OpenProtocolInformation;
 	VOID *ProtocolsPerHandle;
-	VOID *LocateHandleBuffer;
-	VOID *LocateProtocol;
+	EFI_STATUS (EFIAPI *LocateHandleBuffer)(UINTN, EFI_GUID *, VOID *, UINTN *, EFI_HANDLE **);
+	EFI_STATUS (EFIAPI *LocateProtocol)(EFI_GUID *, VOID *, VOID **);
 	VOID *InstallMultipleProtocolInterfaces;
 	VOID *UninstallMultipleProtocolInterfaces;
 	VOID *CalculateCrc32;
@@ -168,12 +215,12 @@ typedef struct {
 	CHAR16 *FirmwareVendor;
 	UINT32 FirmwareRevision;
 	EFI_HANDLE ConsoleInHandle;
-	VOID *ConIn;
+	EFI_SIMPLE_TEXT_INPUT_PROTOCOL *ConIn;
 	EFI_HANDLE ConsoleOutHandle;
 	EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut;
 	EFI_HANDLE StandardErrorHandle;
 	EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *StdErr;
-	VOID *RuntimeServices;
+	EFI_RUNTIME_SERVICES *RuntimeServices;
 	EFI_BOOT_SERVICES *BootServices;
 	UINTN NumberOfTableEntries;
 	VOID *ConfigurationTable;
@@ -247,6 +294,34 @@ typedef struct {
 	CHAR16 FileName[1];
 } EFI_FILE_INFO;
 
+typedef struct {
+	UINT64 Size;
+	BOOLEAN ReadOnly;
+	UINT64 VolumeSize;
+	UINT64 FreeSpace;
+	UINT32 BlockSize;
+	CHAR16 VolumeLabel[1];
+} EFI_FILE_SYSTEM_INFO;
+
+typedef struct {
+	UINT8 Type;
+	UINT8 SubType;
+	UINT8 Length[2];
+} __attribute__((packed)) EFI_DEVICE_PATH_PROTOCOL;
+
+typedef struct {
+	CHAR16 *(EFIAPI *ConvertDeviceNodeToText)(EFI_DEVICE_PATH_PROTOCOL *, BOOLEAN, BOOLEAN);
+	CHAR16 *(EFIAPI *ConvertDevicePathToText)(EFI_DEVICE_PATH_PROTOCOL *, BOOLEAN, BOOLEAN);
+} EFI_DEVICE_PATH_TO_TEXT_PROTOCOL;
+
+#define EFI_BY_PROTOCOL 2
+#define EFI_DEVICE_PATH_TYPE_MEDIA 0x04
+#define EFI_DEVICE_PATH_SUBTYPE_FILEPATH 0x04
+#define EFI_DEVICE_PATH_TYPE_END 0x7f
+#define EFI_DEVICE_PATH_SUBTYPE_END_ENTIRE 0xff
+
+#define EFI_FILE_MODE_READ 0x0000000000000001ULL
+
 static EFI_GUID loaded_image_protocol_guid = {
 	0x5b1b31a1, 0x9562, 0x11d2, { 0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b }
 };
@@ -256,8 +331,18 @@ static EFI_GUID simple_file_system_guid = {
 static EFI_GUID file_info_guid = {
 	0x09576e92, 0x6d3f, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b }
 };
-
-#define EFI_FILE_MODE_READ 0x0000000000000001ULL
+static EFI_GUID file_system_info_guid = {
+	0x09576e93, 0x6d3f, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b }
+};
+static EFI_GUID device_path_guid = {
+	0x09576e91, 0x6d3f, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b }
+};
+static EFI_GUID device_path_to_text_guid = {
+	0x8b843e20, 0x8132, 0x4852, { 0x90, 0xcc, 0x55, 0x1a, 0x4e, 0x4a, 0x7f, 0x1c }
+};
+static EFI_GUID global_variable_guid = {
+	0x8be4df61, 0x93ca, 0x11d2, { 0xaa, 0x0d, 0x00, 0xe0, 0x98, 0x03, 0x2b, 0x8c }
+};
 
 /* ---- x86 boot protocol structures -------------------------------------- */
 
@@ -341,6 +426,7 @@ typedef void (*handover_fn)(VOID *handle, EFI_SYSTEM_TABLE *st,
 
 static EFI_SYSTEM_TABLE *ST;
 static EFI_BOOT_SERVICES *BS;
+static EFI_RUNTIME_SERVICES *RS;
 
 /* kept out of efi_main's stack frame: >4 KiB frames need a __chkstk probe */
 static UINT8 first_page[4096];
@@ -394,6 +480,20 @@ VOID *memset(VOID *dst, int c, UINTN n)
 	while (n--)
 		*d++ = (UINT8)c;
 	return dst;
+}
+
+__attribute__((no_builtin("memcmp")))
+int memcmp(const VOID *a, const VOID *b, UINTN n)
+{
+	const UINT8 *p = a, *q = b;
+
+	while (n--) {
+		if (*p != *q)
+			return (int)*p - (int)*q;
+		p++;
+		q++;
+	}
+	return 0;
 }
 
 static VOID print(CHAR16 *s)
@@ -515,6 +615,650 @@ static EFI_STATUS alloc_pages(EFI_MEMORY_TYPE type, UINTN size,
 	return EFI_SUCCESS;
 }
 
+/* ---- installer mode ---------------------------------------------------- */
+
+static VOID print_ch(CHAR16 ch)
+{
+	CHAR16 buf[2];
+
+	buf[0] = ch;
+	buf[1] = 0;
+	print(buf);
+}
+
+static VOID print_hex4(UINT16 v)
+{
+	static const CHAR16 digits[] = L"0123456789abcdef";
+	CHAR16 buf[5];
+	UINTN i;
+
+	for (i = 0; i < 4; i++)
+		buf[i] = digits[(v >> ((3 - i) * 4)) & 0xf];
+	buf[4] = 0;
+	print(buf);
+}
+
+static VOID boot_var_name(CHAR16 *name, UINT16 index)
+{
+	static const CHAR16 digits[] = L"0123456789ABCDEF";
+
+	name[0] = L'B';
+	name[1] = L'o';
+	name[2] = L'o';
+	name[3] = L't';
+	name[4] = digits[(index >> 12) & 0xf];
+	name[5] = digits[(index >> 8) & 0xf];
+	name[6] = digits[(index >> 4) & 0xf];
+	name[7] = digits[index & 0xf];
+	name[8] = 0;
+}
+
+static UINTN str_len16(const CHAR16 *s)
+{
+	UINTN n = 0;
+
+	while (s[n])
+		n++;
+	return n;
+}
+
+static BOOLEAN chr_equal_ci(CHAR16 a, CHAR16 b)
+{
+	if (a >= L'a' && a <= L'z')
+		a -= 32;
+	if (b >= L'a' && b <= L'z')
+		b -= 32;
+	return a == b;
+}
+
+static BOOLEAN str_equal_ci(const CHAR16 *a, const CHAR16 *b)
+{
+	while (*a && *b) {
+		if (!chr_equal_ci(*a, *b))
+			return FALSE;
+		a++;
+		b++;
+	}
+	return *a == *b;
+}
+
+/* does a (possibly unterminated) LoadOptions string contain token? */
+static BOOLEAN load_options_have(EFI_LOADED_IMAGE_PROTOCOL *li, const CHAR16 *token)
+{
+	UINTN i, n = li->LoadOptionsSize / sizeof(CHAR16);
+	CHAR16 *opt = li->LoadOptions;
+
+	if (!opt)
+		return FALSE;
+	for (i = 0; i + str_len16(token) <= n; i++) {
+		if (str_equal_ci(opt + i, token))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static UINTN dp_node_len(EFI_DEVICE_PATH_PROTOCOL *node)
+{
+	return (UINTN)node->Length[0] | ((UINTN)node->Length[1] << 8);
+}
+
+static BOOLEAN dp_is_end(EFI_DEVICE_PATH_PROTOCOL *node)
+{
+	return node->Type == EFI_DEVICE_PATH_TYPE_END &&
+	       node->SubType == EFI_DEVICE_PATH_SUBTYPE_END_ENTIRE;
+}
+
+static EFI_DEVICE_PATH_PROTOCOL *dp_next(EFI_DEVICE_PATH_PROTOCOL *node)
+{
+	return (EFI_DEVICE_PATH_PROTOCOL *)((UINT8 *)node + dp_node_len(node));
+}
+
+static BOOLEAN dp_is_filepath(EFI_DEVICE_PATH_PROTOCOL *node)
+{
+	return node->Type == EFI_DEVICE_PATH_TYPE_MEDIA &&
+	       node->SubType == EFI_DEVICE_PATH_SUBTYPE_FILEPATH;
+}
+
+/* length of all nodes up to (not including) the end node */
+static UINTN dp_nodes_len(EFI_DEVICE_PATH_PROTOCOL *dp)
+{
+	UINTN len = 0;
+
+	while (!dp_is_end(dp)) {
+		len += dp_node_len(dp);
+		dp = dp_next(dp);
+	}
+	return len;
+}
+
+/* last file path node of our own loaded image, and the file name in it */
+static EFI_STATUS self_path_and_name(EFI_LOADED_IMAGE_PROTOCOL *li,
+				     CHAR16 **path, CHAR16 **name)
+{
+	EFI_DEVICE_PATH_PROTOCOL *node = li->FilePath, *fp = 0;
+	CHAR16 *start, *walk, *namep;
+
+	if (!node)
+		return EFI_NOT_FOUND;
+	while (!dp_is_end(node)) {
+		if (dp_is_filepath(node))
+			fp = node;
+		node = dp_next(node);
+	}
+	if (!fp)
+		return EFI_NOT_FOUND;
+	start = (CHAR16 *)((UINT8 *)fp + 4);
+	namep = start;
+	for (walk = start; *walk; walk++)
+		if (*walk == L'\\' || *walk == L'/')
+			namep = walk + 1;
+	*path = start;
+	*name = namep;
+	return EFI_SUCCESS;
+}
+
+/* device part of dp + file path node for path + end node */
+static EFI_DEVICE_PATH_PROTOCOL *dp_with_file(EFI_DEVICE_PATH_PROTOCOL *dp,
+					      const CHAR16 *path)
+{
+	UINTN dev_len = dp_nodes_len(dp);
+	UINTN path_len = str_len16(path);
+	UINTN fp_len = 4 + (path_len + 1) * 2, total = dev_len + fp_len + 4;
+	EFI_DEVICE_PATH_PROTOCOL *full;
+	UINT8 *fp;
+	VOID *p = 0;
+
+	if (EFI_ERROR(BS->AllocatePool(EfiLoaderData, total, &p)))
+		return 0;
+	full = p;
+	memcpy(full, dp, dev_len);
+	fp = (UINT8 *)full + dev_len;
+	fp[0] = EFI_DEVICE_PATH_TYPE_MEDIA;
+	fp[1] = EFI_DEVICE_PATH_SUBTYPE_FILEPATH;
+	fp[2] = fp_len & 0xff;
+	fp[3] = fp_len >> 8;
+	memcpy(fp + 4, path, (path_len + 1) * 2);
+	fp += fp_len;
+	fp[0] = EFI_DEVICE_PATH_TYPE_END;
+	fp[1] = EFI_DEVICE_PATH_SUBTYPE_END_ENTIRE;
+	fp[2] = 4;
+	fp[3] = 0;
+	return full;
+}
+
+static VOID print_trunc(const CHAR16 *s, UINTN max)
+{
+	CHAR16 buf[80];
+	UINTN i = 0;
+
+	while (i < max && i < sizeof(buf) / sizeof(buf[0]) - 1 && s[i]) {
+		buf[i] = s[i];
+		i++;
+	}
+	if (s[i]) {
+		buf[i++] = L'.';
+		buf[i++] = L'.';
+		buf[i++] = L'.';
+	}
+	buf[i] = 0;
+	print(buf);
+}
+
+/* wait for any key (polling: no event services needed) */
+static EFI_INPUT_KEY wait_key(VOID)
+{
+	EFI_INPUT_KEY key = { 0, 0 };
+
+	while (EFI_ERROR(ST->ConIn->ReadKeyStroke(ST->ConIn, &key)))
+		BS->Stall(20000);
+	return key;
+}
+
+/* read a decimal number, terminated by Enter; q/ESC cancels */
+static EFI_STATUS read_number(UINTN *out)
+{
+	UINTN val = 0;
+	BOOLEAN any = FALSE;
+
+	for (;;) {
+		EFI_INPUT_KEY key = wait_key();
+
+		if (key.ScanCode == 0x17 || key.UnicodeChar == L'q' ||
+		    key.UnicodeChar == L'Q')
+			return EFI_ABORTED;
+		if (key.UnicodeChar == L'\r' || key.UnicodeChar == L'\n') {
+			if (any) {
+				*out = val;
+				return EFI_SUCCESS;
+			}
+			continue;
+		}
+		if (key.UnicodeChar >= L'0' && key.UnicodeChar <= L'9' && val < 1000) {
+			val = val * 10 + (key.UnicodeChar - L'0');
+			any = TRUE;
+			print_ch(key.UnicodeChar);
+		} else if (key.UnicodeChar == 0x08 && any) {
+			val /= 10;
+			any = val != 0;
+			print(L"\b \b");
+		}
+	}
+}
+
+static VOID *pool_alloc(UINTN size)
+{
+	VOID *p = 0;
+
+	if (EFI_ERROR(BS->AllocatePool(EfiLoaderData, size, &p)))
+		return 0;
+	return p;
+}
+
+static VOID *pool_alloc_zero(UINTN size)
+{
+	VOID *p = pool_alloc(size);
+
+	if (p)
+		memset(p, 0, size);
+	return p;
+}
+
+/* read a variable into a freshly allocated buffer (NULL/0 if absent/empty) */
+static EFI_STATUS read_variable(CHAR16 *name, EFI_GUID *guid, UINT32 *attrs,
+				VOID **data, UINTN *size)
+{
+	UINT8 stack[256];
+	UINTN cap = sizeof(stack);
+	EFI_STATUS status;
+
+	status = RS->GetVariable(name, guid, attrs, &cap, stack);
+	if (status == EFI_BUFFER_TOO_SMALL) {
+		*data = pool_alloc(cap);
+		if (!*data)
+			return EFI_OUT_OF_RESOURCES;
+		status = RS->GetVariable(name, guid, attrs, &cap, *data);
+		if (EFI_ERROR(status)) {
+			BS->FreePool(*data);
+			*data = 0;
+			return status;
+		}
+		*size = cap;
+		return EFI_SUCCESS;
+	}
+	if (status == EFI_NOT_FOUND) {
+		*data = 0;
+		*size = 0;
+		return status;
+	}
+	if (EFI_ERROR(status))
+		return status;
+	if (cap == 0) {
+		*data = 0;
+		*size = 0;
+		return EFI_SUCCESS;
+	}
+	*data = pool_alloc(cap);
+	if (!*data)
+		return EFI_OUT_OF_RESOURCES;
+	memcpy(*data, stack, cap);
+	*size = cap;
+	return EFI_SUCCESS;
+}
+
+static BOOLEAN boot_var_index(const CHAR16 *name, UINT16 *index)
+{
+	UINTN i, v = 0;
+
+	if (str_len16(name) != 8)
+		return FALSE;
+	if (name[0] != L'B' || name[1] != L'o' || name[2] != L'o' || name[3] != L't')
+		return FALSE;
+	for (i = 4; i < 8; i++) {
+		CHAR16 c = name[i];
+
+		if (c >= L'0' && c <= L'9')
+			v = v * 16 + (c - L'0');
+		else if (c >= L'A' && c <= L'F')
+			v = v * 16 + (c - L'A' + 10);
+		else if (c >= L'a' && c <= L'f')
+			v = v * 16 + (c - L'a' + 10);
+		else
+			return FALSE;
+	}
+	*index = (UINT16)v;
+	return TRUE;
+}
+
+/*
+ * Create (or find) the Boot#### entry for \EFI\BOOT\BOOTKIT.EFI on
+ * vol_handle and put it first in BootOrder.
+ */
+static EFI_STATUS boot_entry_add(EFI_HANDLE vol_handle, CHAR16 *file_path)
+{
+	EFI_DEVICE_PATH_PROTOCOL *vol_dp = 0, *full = 0;
+	EFI_STATUS status;
+	CHAR16 *name = 0, *desc = L"MikroTikBootKit";
+	EFI_GUID guid;
+	UINTN full_len, name_size, name_cap = 4096;
+	UINTN desc_len = str_len16(desc) + 1;
+	UINT16 index = 0xffff, max_index = 0xffff, i;
+	BOOLEAN found = FALSE;
+	VOID *data = 0, *order = 0, *new_order = 0;
+	UINTN data_size = 0, order_size = 0, entries = 0;
+	UINT32 attrs = 0, order_attrs = EFI_VARIABLE_NON_VOLATILE |
+				      EFI_VARIABLE_BOOTSERVICE_ACCESS |
+				      EFI_VARIABLE_RUNTIME_ACCESS;
+
+	status = BS->HandleProtocol(vol_handle, &device_path_guid, (VOID **)&vol_dp);
+	if (EFI_ERROR(status))
+		return status;
+	full = dp_with_file(vol_dp, file_path);
+	if (!full)
+		return EFI_OUT_OF_RESOURCES;
+	full_len = dp_nodes_len(full) + 4;
+
+	name = pool_alloc_zero(name_cap);
+	if (!name) {
+		status = EFI_OUT_OF_RESOURCES;
+		goto out;
+	}
+
+	/* look for an entry that already points at this file, and the next free id */
+	memset(&guid, 0, sizeof(guid));
+	for (;;) {
+		name_size = name_cap;
+		status = RS->GetNextVariableName(&name_size, name, &guid);
+		if (status == EFI_NOT_FOUND) {
+			status = EFI_SUCCESS;
+			break;
+		}
+		if (EFI_ERROR(status))
+			goto out;
+		if (!boot_var_index(name, &i))
+			continue;
+		if (max_index == 0xffff || i > max_index)
+			max_index = i;
+		status = read_variable(name, &global_variable_guid, &attrs, &data, &data_size);
+		if (EFI_ERROR(status) || data_size < 6)
+			continue;
+		{
+			UINT16 fplen = *(UINT16 *)((UINT8 *)data + 4);
+			CHAR16 *d = (CHAR16 *)((UINT8 *)data + 6);
+			UINTN dlen = 0;
+			UINT8 *fplist;
+
+			while (dlen < data_size && d[dlen])
+				dlen++;
+			fplist = (UINT8 *)(d + dlen + 1);
+			if (fplen == full_len &&
+			    (UINTN)(fplist - (UINT8 *)data) + fplen <= data_size &&
+			    memcmp(fplist, full, full_len) == 0) {
+				index = i;
+				found = TRUE;
+			}
+			if (data)
+				BS->FreePool(data);
+			data = 0;
+			if (found)
+				break;
+		}
+	}
+	if (!found) {
+		index = (max_index == 0xffff) ? 0 : (UINT16)(max_index + 1);
+	}
+
+	/* EFI_LOAD_OPTION: attributes, FilePathListLength, description, path list */
+	{
+		UINTN opt_size = 4 + 2 + desc_len * 2 + full_len;
+		UINT8 *opt = pool_alloc_zero(opt_size);
+
+		if (!opt) {
+			status = EFI_OUT_OF_RESOURCES;
+			goto out;
+		}
+		*(UINT32 *)opt = EFI_LOAD_OPTION_ACTIVE;
+		*(UINT16 *)(opt + 4) = (UINT16)full_len;
+		memcpy(opt + 6, desc, desc_len * 2);
+		memcpy(opt + 6 + desc_len * 2, full, full_len);
+		boot_var_name(name, index);
+		status = RS->SetVariable(name, &global_variable_guid,
+					 EFI_VARIABLE_NON_VOLATILE |
+					 EFI_VARIABLE_BOOTSERVICE_ACCESS |
+					 EFI_VARIABLE_RUNTIME_ACCESS,
+					 opt_size, opt);
+		BS->FreePool(opt);
+		if (EFI_ERROR(status))
+			goto out;
+	}
+
+	/* BootOrder: drop the entry if present, then prepend it */
+	status = read_variable(L"BootOrder", &global_variable_guid, &order_attrs,
+			       &order, &order_size);
+	if (EFI_ERROR(status) && status != EFI_NOT_FOUND)
+		goto out;
+	entries = order_size / sizeof(UINT16);
+	new_order = pool_alloc_zero((entries + 1) * sizeof(UINT16));
+	if (!new_order) {
+		status = EFI_OUT_OF_RESOURCES;
+		goto out;
+	}
+	((UINT16 *)new_order)[0] = index;
+	{
+		UINTN k = 1;
+
+		for (i = 0; i < entries; i++)
+			if (((UINT16 *)order)[i] != index)
+				((UINT16 *)new_order)[k++] = ((UINT16 *)order)[i];
+		status = RS->SetVariable(L"BootOrder", &global_variable_guid,
+					 order_attrs, k * sizeof(UINT16), new_order);
+		if (EFI_ERROR(status))
+			goto out;
+	}
+
+	print(L"efiboot: boot entry Boot");
+	print_hex4(index);
+	print(L" -> \\EFI\\BOOT\\BOOTKIT.EFI\r\n");
+
+out:
+	if (full)
+		BS->FreePool(full);
+	if (name)
+		BS->FreePool(name);
+	if (order)
+		BS->FreePool(order);
+	if (new_order)
+		BS->FreePool(new_order);
+	return status;
+}
+
+static EFI_STATUS installer_run(EFI_HANDLE image, EFI_LOADED_IMAGE_PROTOCOL *li)
+{
+	EFI_STATUS status;
+	EFI_FILE_PROTOCOL *root, *f, *dir;
+	EFI_FILE_SYSTEM_INFO *fsi;
+	EFI_HANDLE *handles = 0;
+	UINTN count = 0, volumes = 0, i, choice = 0;
+	CHAR16 *self_path, *self_name;
+	UINT8 info[560];
+	UINTN info_size;
+	UINT64 size64;
+	UINTN src_len, written;
+	VOID *src = 0;
+	EFI_DEVICE_PATH_TO_TEXT_PROTOCOL *d2t = 0;
+
+	print(L"efiboot: installer mode\r\n");
+
+	if (!ST->ConIn)
+		return fail(EFI_UNSUPPORTED, L"no console input available");
+
+	status = self_path_and_name(li, &self_path, &self_name);
+	if (EFI_ERROR(status))
+		return fail(status, L"cannot determine my own path");
+
+	/* read ourselves so we can write the same image elsewhere */
+	status = open_root(image, &root);
+	if (EFI_ERROR(status))
+		return fail(status, L"cannot open my own volume");
+	status = open_file(root, self_path, &f);
+	if (EFI_ERROR(status))
+		return fail(status, L"cannot open my own file");
+	status = file_size(f, &size64);
+	if (EFI_ERROR(status))
+		return fail(status, L"cannot size my own file");
+	src_len = (UINTN)size64;
+	status = alloc_pages(EfiLoaderData, src_len, 0xffffffffULL, &src);
+	if (EFI_ERROR(status))
+		return fail(status, L"cannot allocate memory");
+	status = read_file(f, 0, src, src_len);
+	f->Close(f);
+	if (EFI_ERROR(status))
+		return fail(status, L"cannot read my own file");
+
+	/* list the volumes that look like EFI system partitions */
+	status = BS->LocateHandleBuffer(EFI_BY_PROTOCOL, &simple_file_system_guid,
+					0, &count, &handles);
+	if (EFI_ERROR(status))
+		return fail(status, L"cannot enumerate file systems");
+	BS->LocateProtocol(&device_path_to_text_guid, 0, (VOID **)&d2t);
+
+	print(L"efiboot: EFI partitions:\r\n");
+	for (i = 0; i < count; i++) {
+		EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs;
+		EFI_DEVICE_PATH_PROTOCOL *dp = 0;
+
+		if (EFI_ERROR(BS->HandleProtocol(handles[i], &simple_file_system_guid,
+						 (VOID **)&fs)))
+			continue;
+		if (EFI_ERROR(fs->OpenVolume(fs, &root)))
+			continue;
+		if (EFI_ERROR(root->Open(root, &dir, L"\\EFI", EFI_FILE_MODE_READ, 0))) {
+			root->Close(root);
+			continue;
+		}
+		dir->Close(dir);
+		dir = 0;
+
+		fsi = 0;
+		info_size = sizeof(info);
+		if (!EFI_ERROR(root->GetInfo(root, &file_system_info_guid, &info_size, info)))
+			fsi = (EFI_FILE_SYSTEM_INFO *)info;
+		print(L"efiboot:   ");
+		print_dec(volumes + 1);
+		print(L") ");
+		if (fsi && fsi->VolumeLabel[0])
+			print_trunc(fsi->VolumeLabel, 32);
+		else
+			print(L"(no label)");
+		print(L", ");
+		if (fsi)
+			print_dec(fsi->VolumeSize / (1024 * 1024));
+		else
+			print_ch(L'?');
+		print(L" MB");
+		if (handles[i] == li->DeviceHandle)
+			print(L", this installer");
+		print(L"\r\n");
+		if (d2t && !EFI_ERROR(BS->HandleProtocol(handles[i], &device_path_guid,
+							 (VOID **)&dp))) {
+			CHAR16 *text = d2t->ConvertDevicePathToText(dp, FALSE, TRUE);
+
+			if (text) {
+				print(L"efiboot:      ");
+				print_trunc(text, 68);
+				print(L"\r\n");
+				BS->FreePool(text);
+			}
+		}
+		handles[volumes++] = handles[i];
+	}
+	if (!volumes)
+		return fail(EFI_NOT_FOUND, L"no EFI partitions found");
+
+	/* ask the user where to install */
+	for (;;) {
+		print(L"efiboot: select the target EFI partition [1-");
+		print_dec(volumes);
+		print(L"] (q to cancel): ");
+		status = read_number(&choice);
+		print(L"\r\n");
+		if (status == EFI_ABORTED) {
+			print(L"efiboot: cancelled\r\n");
+			return EFI_ABORTED;
+		}
+		if (EFI_ERROR(status))
+			return status;
+		if (choice >= 1 && choice <= volumes)
+			break;
+		print(L"efiboot: invalid selection\r\n");
+	}
+	print(L"efiboot: installing to partition ");
+	print_dec(choice);
+	print(L"\r\n");
+	{
+		EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs;
+
+		if (EFI_ERROR(BS->HandleProtocol(handles[choice - 1], &simple_file_system_guid,
+						 (VOID **)&fs)) ||
+		    EFI_ERROR(fs->OpenVolume(fs, &root)))
+			return fail(EFI_DEVICE_ERROR, L"cannot open the selected partition");
+	}
+
+	/* copy ourselves to \EFI\BOOT\BOOTKIT.EFI */
+	if (EFI_ERROR(root->Open(root, &dir, L"\\EFI",
+				 EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE,
+				 EFI_FILE_DIRECTORY)))
+		return fail(EFI_DEVICE_ERROR, L"cannot open \\EFI");
+	dir->Close(dir);
+	if (EFI_ERROR(root->Open(root, &dir, L"\\EFI\\BOOT",
+				 EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE,
+				 EFI_FILE_DIRECTORY)))
+		return fail(EFI_DEVICE_ERROR, L"cannot open \\EFI\\BOOT");
+	dir->Close(dir);
+
+	status = root->Open(root, &f, L"\\EFI\\BOOT\\BOOTKIT.EFI",
+			    EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
+	if (EFI_ERROR(status))
+		return fail(status, L"cannot create \\EFI\\BOOT\\BOOTKIT.EFI");
+	{
+		UINT8 fi_buf[sizeof(EFI_FILE_INFO) + 8];
+		EFI_FILE_INFO *fi = (EFI_FILE_INFO *)fi_buf;
+
+		memset(fi_buf, 0, sizeof(fi_buf));
+		fi->Size = sizeof(EFI_FILE_INFO) + 2;
+		fi->FileSize = 0;
+		f->SetInfo(f, &file_info_guid, sizeof(EFI_FILE_INFO) + 2, fi_buf);
+	}
+	written = src_len;
+	status = f->Write(f, &written, src);
+	f->Flush(f);
+	f->Close(f);
+	if (EFI_ERROR(status) || written != src_len)
+		return fail(EFI_ERROR(status) ? status : EFI_DEVICE_ERROR,
+			    L"cannot write \\EFI\\BOOT\\BOOTKIT.EFI");
+
+	/* verify what was written */
+	status = open_file(root, L"\\EFI\\BOOT\\BOOTKIT.EFI", &f);
+	if (EFI_ERROR(status))
+		return fail(status, L"cannot reopen the installed file");
+	status = file_size(f, &size64);
+	f->Close(f);
+	if (EFI_ERROR(status) || size64 != src_len)
+		return fail(EFI_DEVICE_ERROR, L"installed file size mismatch");
+	print(L"efiboot: copied ");
+	print_dec(src_len);
+	print(L" bytes\r\n");
+
+	status = boot_entry_add(handles[choice - 1], L"\\EFI\\BOOT\\BOOTKIT.EFI");
+	BS->FreePool(handles);
+	if (EFI_ERROR(status))
+		return fail(status, L"cannot create the boot entry");
+
+	print(L"efiboot: installed; press any key to reboot\r\n");
+	wait_key();
+	RS->ResetSystem(EfiResetCold, EFI_SUCCESS, 0, 0);
+	return EFI_SUCCESS;
+}
+
 /* ---- boot -------------------------------------------------------------- */
 
 static VOID print_kernel_version(const UINT8 *kbuf, UINTN klen)
@@ -553,8 +1297,30 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
 
 	ST = st;
 	BS = st->BootServices;
+	RS = st->RuntimeServices;
 
 	print(L"efiboot: MikroTik boot kit loader\r\n");
+
+	/*
+	 * Installer mode: we were booted as \EFI\BOOT\BOOTX64.EFI (the removable
+	 * media fallback, i.e. from an installer stick) or asked for it with
+	 * "--install" in the load options.
+	 */
+	{
+		EFI_LOADED_IMAGE_PROTOCOL *li;
+
+		if (!EFI_ERROR(BS->HandleProtocol(image, &loaded_image_protocol_guid,
+						  (VOID **)&li))) {
+			CHAR16 *path, *name;
+			BOOLEAN install = load_options_have(li, L"--install");
+
+			if (!EFI_ERROR(self_path_and_name(li, &path, &name)) &&
+			    str_equal_ci(name, L"BOOTX64.EFI"))
+				install = TRUE;
+			if (install)
+				return installer_run(image, li);
+		}
+	}
 
 	status = open_root(image, &root);
 	if (EFI_ERROR(status))

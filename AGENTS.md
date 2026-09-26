@@ -80,9 +80,10 @@ bootloader/                 the EFI-side loader (-> \EFI\BOOT\BOOTKIT.EFI)
 tools/musl_i386.sh          builds the local i486-musl toolchain (downloads
                             and compiles musl; picked up by build.sh)
 build.sh                    builds the bootkit, the bootloader and bootkit.img
-vmtest.sh                   prepare/install/boot/interact with a test image copy
+vmtest.sh                   prepare/install/boot/interact with a test image copy,
+                            install a clean image from an installer ISO
 vmconsole.py                serial-console helper used by vmtest.sh cmd and the
-                            installer driver
+                            bootkit/RouterOS installer drivers
 docs/ptrace-init-preload.md design + findings + verified log
 ```
 
@@ -150,7 +151,8 @@ Needs: KVM (`-enable-kvm` is mandatory), `clang` + `lld` (or
 `mtools` (`mformat`/`mmd`/`mcopy` also build `bootkit.img`), `cpio`, and a
 RouterOS x86 image.  Use a *copy* of the image; the ESP (partition 1) is
 rewritten.  Always kill the VM by pidfile when done — do not leave QEMU
-instances running.
+instances running.  Installing from an ISO additionally needs `isoinfo`
+(genisoimage) or `xorriso` and a `mikrotik-*.iso`.
 
 `./vmtest.sh test` does all of the following on a copy (direct install).
 `./vmtest.sh prepare` builds the kit, the test image and copies `bootkit.img`
@@ -170,7 +172,7 @@ tracer/probe output only appears after flipping `debug=1` in the config:
 
 # 2. test image: copy, make it CHR mode (no licence needed); nothing is added
 #    to its ESP - the installer does that
-IMG=../.work/pb-test.img        # clone of the clean x86 image; keep it on real disk, not tmpfs
+IMG=./.work/pb-test.img         # clone of the clean x86 image (on real disk)
 cp ../x86-7.23.7-clean.img $IMG
 printf '\001' | dd of=$IMG bs=1 seek=$((0x150)) conv=notrunc status=none   # MBR mode flag -> CHR
 
@@ -196,6 +198,29 @@ grep -a ptrace-init /tmp/serial.log      # tracer messages
 grep -a ldpreload /tmp/serial.log        # every binary that loaded the probe
 tail -c 100 /tmp/serial.log              # should end with "CHR Login:"
 kill $(cat /tmp/qemu.pid)
+```
+
+### Installing a clean image from an ISO
+
+`./vmtest.sh iso-install [ISO] [OUT]` produces a fresh "clean image" from an
+installer ISO without touching the old one: it boots the ISO under OVMF (EFI
+mode, which is what makes the stock installer create the FAT EFI partition the
+tests expect; a copy of the ISO gets `console=ttyS0,115200n8` added to its
+refind options so the installer talks to the serial socket), answers the
+installer menu (default package selection) and writes the 128 MB image to
+`$WORK/clean.img` (or `$ISO_OUT`; `IMG_SIZE=` changes the size; the default
+ISO is the newest `mikrotik-*.iso` next to the script).  It then boots the new
+image once to run its first login (answers the licence question with "y" and
+quits the agreement pager with q + Enter, then sets the admin password to
+admin/admin), so the result is usable like the older clean images and `cmd`
+works right away.  The layout is the same the older clean images have
+(partition 1 at LBA 2048, the stock kernel at `\EFI\BOOT\BOOTX64.EFI`).
+
+`prepare` also takes an ISO directly and turns it into `$WORK/clean.img` if
+that does not exist yet, so a full run from an ISO is:
+
+```sh
+IMG_SRC=./mikrotik-7.24.4.iso MODE=chr ./vmtest.sh test
 ```
 
 ### Installing on real hardware

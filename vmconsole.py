@@ -4,13 +4,20 @@
 Usage: vmconsole.py <serial-socket> "<routeros command>"
        vmconsole.py <serial-socket> --shell
        vmconsole.py <serial-socket> --install [MODE]
+       vmconsole.py <serial-socket> --ros-install
+       vmconsole.py <serial-socket> --ros-firstboot
 
 Logs in as admin/admin (a fresh image walks a forced password change, the
 prompts are answered with "n"/admin), runs the command and prints everything
 the console sent back.  --install instead drives the bootkit installer: it
 picks the EFI partition that is not the installer's own medium, selects the
 install mode (MODE 1 = direct, the default, 2 = removable), confirms and
-presses a key to reboot.
+presses a key to reboot.  --ros-install drives the stock RouterOS installer
+from an installer ISO: it takes the default package selection, confirms the
+disk wipe and waits for the install to finish.  --ros-firstboot does the first
+login of a freshly installed image: the admin password is still empty, the
+licence question is answered with "y" and the agreement pager is quit with
+q + Enter, and the forced password change ends with admin/admin.
 """
 import re
 import socket
@@ -94,6 +101,100 @@ class Console:
         return out
 
 
+def skip_pager(c):
+    """Quit the licence agreement pager with q + Enter instead of scrolling
+    through every page.  Returns True once the pager is gone; the pager footer
+    is dropped and the text that follows stays in the console buffer."""
+    footer = b'press Enter (q to abort)'
+    end = re.compile(rb'(Please press "Enter" to continue!|Change your password|'
+                     rb'new password>|\[admin@[^\]]*\]\s*>)')
+    for _ in range(3):
+        c.send(b'q')
+        c.send(b'\r')
+        if not c.expect(rb'(press Enter \(q to abort\)|Please press "Enter" to continue!|'
+                        rb'Change your password|new password>|\[admin@[^\]]*\]\s*>)',
+                        30):
+            return False
+        text = bytes(c.buf)
+        del c.buf[:]
+        pos = text.rfind(footer)
+        tail = text[pos + len(footer):] if pos >= 0 else text
+        if end.search(tail):
+            c.buf += tail               # keep only what follows the pager
+            return True
+        # the footer is still the last thing seen: the q did not take, retry
+    return False
+
+
+def fresh_login(c, show=False, login_timeout=5):
+    """Log into a never-booted image.  admin has no password yet and RouterOS
+    walks its first-login flow: the licence question is answered with "y", the
+    agreement pager is quit with q + Enter (no need to scroll it), the "no
+    software key" notice is acknowledged and the forced password change is set
+    to admin/admin.  Returns True once the CLI prompt is up."""
+    if not c.expect(rb'(Do you want to see the software license\? \[Y/n\]:|Login:)',
+                    login_timeout, show=show, fresh=True):
+        c.send(b'\r')                   # provoke a login prompt
+        if not c.expect(rb'(Do you want to see the software license\? \[Y/n\]:|Login:)',
+                        30, show=show, fresh=True):
+            return False
+    if 'software license' in strip(bytes(c.buf)):
+        c.send(b'y')
+        del c.buf[:]
+        if show:
+            print('[dismissing the licence agreement pager]')
+        if not skip_pager(c):
+            return False
+        if not c.expect(rb'(Please press "Enter" to continue!|Login:)', 60, show=show):
+            return False
+        if 'Please press "Enter"' in strip(bytes(c.buf)):
+            c.send(b'\r')
+            del c.buf[:]
+            if not c.expect(LOGIN, 30, show=show):
+                return False
+    c.line('admin')
+    if not c.expect(PASSWORD, 30, show=show):
+        return False
+    c.send(b'\r')                       # the password is still empty
+    del c.buf[:]
+    # whatever the first login puts on the console, answer it until the prompt
+    for _ in range(8):
+        if not c.expect(rb'(software license\? \[Y/n\]:|press Enter \(q to abort\)|'
+                        rb'Please press "Enter" to continue!|new password>|'
+                        rb'\[admin@[^\]]*\]\s*>)', 45, show=show):
+            return False
+        text = strip(bytes(c.buf))
+        del c.buf[:]
+        if re.search(r'\[admin@[^\]]*\]\s*>', text):
+            return True
+        if 'new password>' in text:
+            c.line('admin')
+            if not c.expect(rb'repeat new password>', 30, show=show):
+                return False
+            c.line('admin')
+        elif 'Please press "Enter" to continue!' in text:
+            c.send(b'\r')               # the "no software key" notice
+        elif 'software license' in text or 'press Enter (q to abort)' in text:
+            if 'software license' in text:
+                c.send(b'y')
+            if show:
+                print('[dismissing the licence agreement pager]')
+            if not skip_pager(c):
+                return False
+        else:
+            c.send(b'\r')
+    return False
+
+
+def ros_firstboot(c):
+    """--ros-firstboot: run the first login of a freshly installed image (see
+    fresh_login).  Returns 0 on success."""
+    if fresh_login(c, show=True, login_timeout=180):
+        return 0
+    print('[first login failed]')
+    return 1
+
+
 def login(c):
     """Return True once the CLI prompt "[admin@...] >" is up."""
     c.drain(0.4, show=False)
@@ -118,7 +219,8 @@ def login(c):
                 return True
         if c.expect(PROMPT, 3, show=False):
             return True
-    return False
+    # admin/admin did not work; a never-booted image is empty-password
+    return fresh_login(c)
 
 
 def installer(c, mode='1'):
@@ -158,6 +260,33 @@ def installer(c, mode='1'):
     return 0
 
 
+def ros_installer(c):
+    """Drive the stock RouterOS installer from the installer ISO: wait for the
+    package menu, install the default selection, confirm the disk wipe and
+    wait for the reboot prompt.  Returns 0 on success."""
+    if not c.expect(rb'Welcome to MikroTik Router Software installation', 300,
+                    show=True):
+        print('[no installer menu seen]')
+        return 1
+    if not c.expect(rb'cancel and reboot', 60, show=True):
+        print('[no package menu seen]')
+        return 1
+    print('[installing the default selection]')
+    c.send(b'i')
+    if not c.expect(rb'Continue\? \[y/n\]', 120, show=True):
+        print('[no disk confirmation seen]')
+        return 1
+    print('[confirming the disk wipe]')
+    c.send(b'y')
+    if not c.expect(rb'Press ENTER to reboot', 900, show=True):
+        print('[install did not finish]')
+        return 1
+    c.send(b'\r')
+    print('[installed, rebooting]')
+    time.sleep(2)
+    return 0
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__)
@@ -167,6 +296,10 @@ def main():
     try:
         if cmd == '--install':
             return installer(c, sys.argv[3] if len(sys.argv) > 3 else '1')
+        if cmd == '--ros-install':
+            return ros_installer(c)
+        if cmd == '--ros-firstboot':
+            return ros_firstboot(c)
         if cmd == '--shell':
             import threading
 

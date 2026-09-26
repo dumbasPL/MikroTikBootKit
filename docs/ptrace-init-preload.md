@@ -246,6 +246,7 @@ image is never touched):
 
 ```sh
 ./vmtest.sh prepare              # build, copy the image, use bootkit.img as the stick
+./vmtest.sh iso-install          # install a clean image from an installer ISO
 ./vmtest.sh install              # boot stick + target and drive the installer
 ./vmtest.sh boot                 # start QEMU (background, serial on a socket)
 ./vmtest.sh boot-removable       # boot stick + target (stick first)
@@ -259,13 +260,20 @@ image is never touched):
 ```
 
 Environment knobs: `IMG_SRC` (source image, default
-`x86-7.24.4-clean.img`), `WORK` (scratch dir, default `/tmp/opencode/bkvm`),
+`x86-7.24.4-clean.img`; an `.iso` is installed to `$WORK/clean.img` first),
+`ISO_SRC` / `ISO_OUT` / `IMG_SIZE` (the `iso-install` ISO, output image and
+its size), `WORK` (scratch dir, default `.work/` next to the script),
 `MODE=chr|x86|keep` (override the MBR mode flag), `INSTALL_MODE=1|2` (direct or
 removable), `DEBUG=0|1` (build variant, harness default 1), `MEM`, `SMP`.
 `vmconsole.py` is the serial helper used by `vmtest.sh cmd` (logs in as
-admin/admin, declines the forced password change and runs the command) and by
+admin/admin, declines the forced password change and runs the command; a
+never-booted image is detected and set up to admin/admin on the fly), by
 `vmtest.sh install` (`--install <mode>`: picks the non-installer ESP, picks
-the mode, confirms and reboots).
+the mode, confirms and reboots) and by `vmtest.sh iso-install`
+(`--ros-install`: takes the stock installer's default package selection,
+confirms the disk wipe and waits for the install to finish; `--ros-firstboot`:
+runs the first login of the new image, answers the licence question with "y",
+quits the agreement pager with q + Enter and sets admin/admin).
 
 ## 7.24.4 denies PROT_EXEC mmaps of tmpfs files - solved with a bind mount
 

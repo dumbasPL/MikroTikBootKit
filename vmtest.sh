@@ -13,9 +13,15 @@
 # The source image is never modified: everything happens on $WORK/test.img.
 #
 # Usage:
-#   ./vmtest.sh prepare [IMG]   build the bootkit (and bootkit.img), make the
+#   ./vmtest.sh prepare [IMG|ISO]
+#                               build the bootkit (and bootkit.img), make the
 #                               test image, copy the boot image as the stick
-#                               and start from a fresh varstore
+#                               and start from a fresh varstore; an installer
+#                               ISO is installed to $WORK/clean.img first
+#   ./vmtest.sh iso-install [ISO] [OUT]
+#                               install RouterOS from an installer ISO onto a
+#                               fresh disk image (the clean image the tests
+#                               start from; its first boot sets admin/admin)
 #   ./vmtest.sh install         boot stick + target, run the installer
 #   ./vmtest.sh boot            start QEMU in the background (target only)
 #   ./vmtest.sh boot-removable  boot the stick + target (stick first)
@@ -29,8 +35,14 @@
 #                               wait + check
 #
 # Environment:
-#   WORK=/tmp/opencode/bkvm     scratch directory (image copy, logs, pidfile)
-#   IMG=<path>                  source image (default: x86-7.24.4-clean.img)
+#   WORK=$ROOT/.work            scratch directory (image copy, logs, pidfile)
+#   IMG_SRC=<path>              source image (default: x86-7.24.4-clean.img);
+#                               an *.iso is installed first (see iso-install)
+#   ISO_SRC=<path>              installer ISO for "iso-install" (default: the
+#                               newest mikrotik-*.iso next to this script)
+#   ISO_OUT=<path>              image "iso-install" writes (default:
+#                               $WORK/clean.img)
+#   IMG_SIZE=128M               size of that fresh image
 #   MODE=chr|x86|keep           override the MBR mode flag (default: keep)
 #   INSTALL_MODE=1|2            installer mode for "install": 1 direct
 #                               (default), 2 removable
@@ -40,7 +52,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
-WORK=${WORK:-/tmp/opencode/bkvm}
+WORK=${WORK:-$ROOT/.work}
 IMG_SRC=${IMG_SRC:-$ROOT/x86-7.24.4-clean.img}
 IMG=$WORK/test.img
 STICK=$WORK/stick.img
@@ -49,6 +61,7 @@ MODE=${MODE:-keep}
 MEM=${MEM:-1024}
 SMP=${SMP:-2}
 DEBUG=${DEBUG:-1}
+IMG_SIZE=${IMG_SIZE:-128M}
 
 SERIAL_SOCK=$WORK/serial.sock
 SERIAL_LOG=$WORK/serial.log
@@ -101,7 +114,157 @@ qemu_cmd_removable() {
         -serial chardev:ser
 }
 
+# the stock RouterOS installer ISO as a CD-ROM, the fresh target on USB port 1
+# (same device as in the boot tests, so the installed image matches) and a
+# separate varstore; the ISO's EFI boot image (refind) boots the installer
+# under OVMF, which is what makes it create the FAT EFI partition layout
+qemu_cmd_iso() {
+    echo qemu-system-x86_64 -m "$MEM" -smp "$SMP" -cpu host -enable-kvm \
+        -boot order=d \
+        -cdrom "$WORK/ros-install.iso" \
+        -drive if=none,id=d1,file="$1",format=raw \
+        -device qemu-xhci,id=usb-bus \
+        -device usb-storage,bus=usb-bus.0,drive=d1,serial=test \
+        -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+        -drive if=pflash,format=raw,file="$WORK/iso-vars.fd" \
+        -display none \
+        -chardev "socket,id=ser,path=$SERIAL_SOCK,server=on,wait=off,logfile=$SERIAL_LOG" \
+        -serial chardev:ser
+}
+
+# the freshly installed system on its own (no CD, no stick): OVMF's
+# removable-media fallback boots \EFI\BOOT\BOOTX64.EFI from the target, which
+# is what the stock image does; used for the first login of a new image
+qemu_cmd_stock() {
+    echo qemu-system-x86_64 -m "$MEM" -smp "$SMP" -cpu host -enable-kvm \
+        -drive if=none,id=d1,file="$1",format=raw \
+        -device qemu-xhci,id=usb-bus \
+        -device usb-storage,bus=usb-bus.0,drive=d1,serial=test \
+        -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+        -drive if=pflash,format=raw,file="$WORK/iso-vars.fd" \
+        -display none \
+        -chardev "socket,id=ser,path=$SERIAL_SOCK,server=on,wait=off,logfile=$SERIAL_LOG" \
+        -serial chardev:ser
+}
+
+# newest installer ISO next to this script (or $ISO_SRC)
+default_iso() {
+    local f
+    f=$(find "$ROOT" -maxdepth 1 -name 'mikrotik-*.iso' 2>/dev/null |
+        sort -V | tail -n1 || true)
+    [ -n "$f" ] || die "no installer ISO found, pass one or set ISO_SRC"
+    printf '%s\n' "$f"
+}
+
+# byte offset of the ISO's EFI boot image (efiboot.img): the installer ISO
+# boots it through El Torito and its \EFI\BOOT\refind.conf holds the kernel
+# options refind passes to the installer
+iso_efi_offset() {
+    local iso=$1 lba=''
+    lba=$( { isoinfo -i "$iso" -l -R 2>/dev/null || true; } |
+           sed -n 's/.*\[ *\([0-9][0-9]*\) .*\] *efiboot\.img.*/\1/p' | head -n1)
+    if [ -z "$lba" ] && command -v xorriso >/dev/null 2>&1; then
+        lba=$( { xorriso -indev "$iso" -find / -exec report_lba -- 2>/dev/null || true; } |
+               awk '$NF=="/efiboot.img" {print $6; exit}')
+    fi
+    [ -n "$lba" ] || die "cannot locate /efiboot.img in $iso (need isoinfo or xorriso)"
+    echo $((lba * 2048))
+}
+
+# copy the ISO and patch the EFI boot config: add "console=ttyS0,115200n8" to
+# the options refind passes to the installer kernel (so the installer talks to
+# the serial socket) and a short timeout (so it boots without a keypress).
+# Only the bytes of refind.conf inside the EFI boot image change.
+make_install_iso() {
+    local src=$1 dst=$2 off conf=$WORK/iso-refind.conf
+    off=$(iso_efi_offset "$src")
+    export MTOOLS_SKIP_CHECK=1
+    mcopy -o -i "$src@@$off" ::/EFI/BOOT/refind.conf "$conf" 2>/dev/null ||
+        die "cannot read /EFI/BOOT/refind.conf from $src (unsupported ISO)"
+    grep -q 'console=ttyS0' "$conf" ||
+        sed -i -E 's/^([[:space:]]*options[[:space:]]+".*)"$/\1 console=ttyS0,115200n8"/' "$conf"
+    if grep -qE '^[[:space:]]*timeout' "$conf"; then
+        sed -i -E 's/^[[:space:]]*timeout[[:space:]]+[0-9]+/timeout 5/' "$conf"
+    else
+        sed -i '1i timeout 5' "$conf"
+    fi
+    grep -q 'console=ttyS0' "$conf" ||
+        die "no refind options line in $src (unsupported ISO)"
+    cp -f "$src" "$dst"
+    mcopy -o -i "$dst@@$off" "$conf" ::/EFI/BOOT/refind.conf
+    log "== installer ISO prepared ($dst)"
+}
+
+# Install RouterOS from an installer ISO onto a fresh disk image: boot the ISO
+# under OVMF (EFI mode is what makes the installer create the FAT EFI
+# partition layout the tests use), drive the installer menu over the serial
+# console and wait for it to finish.
+cmd_iso_install() {
+    local iso=${1:-${ISO_SRC:-$(default_iso)}}
+    local out=${2:-${ISO_OUT:-$WORK/clean.img}}
+    [ -f "$iso" ] || die "installer ISO not found: $iso"
+    [ -f /usr/share/edk2/x64/OVMF_CODE.4m.fd ] || die "OVMF not found (edk2-ovmf)"
+    mkdir -p "$WORK"
+    log "== installing RouterOS from $iso"
+    make_install_iso "$iso" "$WORK/ros-install.iso"
+
+    rm -f "$out"
+    truncate -s "$IMG_SIZE" "$out"
+
+    stop_qemu
+    rm -f "$WORK/iso-vars.fd"
+    cp -f /usr/share/edk2/x64/OVMF_VARS.4m.fd "$WORK/iso-vars.fd"
+    : > "$SERIAL_LOG"
+    rm -f "$SERIAL_SOCK"
+    # shellcheck disable=SC2046
+    $(qemu_cmd_iso "$out") -daemonize -pidfile "$PIDFILE"
+
+    if ! python3 "$ROOT/vmconsole.py" "$SERIAL_SOCK" --ros-install; then
+        stop_qemu
+        rm -f "$out"
+        die "RouterOS install from $iso failed"
+    fi
+    stop_qemu
+
+    # first boot of the installed system: the admin password is still empty
+    # and RouterOS wants the licence question answered, the agreement pager
+    # dismissed and the password changed; leave the image with admin/admin
+    # like the older hand-made clean images
+    log "== first boot (licence, admin/admin)"
+    rm -f "$WORK/iso-vars.fd"
+    cp -f /usr/share/edk2/x64/OVMF_VARS.4m.fd "$WORK/iso-vars.fd"
+    : > "$SERIAL_LOG"
+    rm -f "$SERIAL_SOCK"
+    # shellcheck disable=SC2046
+    $(qemu_cmd_stock "$out") -daemonize -pidfile "$PIDFILE"
+    if ! python3 "$ROOT/vmconsole.py" "$SERIAL_SOCK" --ros-firstboot; then
+        stop_qemu
+        rm -f "$out"
+        die "first login of $out failed"
+    fi
+    stop_qemu
+    log "== clean image ready: $out ($IMG_SIZE)"
+}
+
+# the image prepare copies from: an installer ISO is first turned into a clean
+# image (cached in $WORK/clean.img; rebuild it with ./vmtest.sh iso-install)
+source_image() {
+    local src=${1:-$IMG_SRC} clean=${ISO_OUT:-$WORK/clean.img}
+    case "$src" in
+        *.iso)
+            if [ -f "$clean" ]; then
+                log "== using the existing clean image $clean"
+                log "   (rebuild it with: $0 iso-install $src)"
+            else
+                cmd_iso_install "$src" "$clean"
+            fi
+            printf '%s\n' "$clean" ;;
+        *)  printf '%s\n' "$src" ;;
+    esac
+}
+
 cmd_prepare() {
+    IMG_SRC=$(source_image "${1:-}")
     [ -f "$IMG_SRC" ] || die "source image not found: $IMG_SRC"
     log "== building bootkit"
     (cd "$ROOT" && DEBUG="$DEBUG" ./build.sh)
@@ -261,6 +424,7 @@ cmd_test_removable() {
 
 case "${1:-}" in
     prepare) shift; cmd_prepare "$@" ;;
+    iso-install) shift; cmd_iso_install "$@" ;;
     install) cmd_install ;;
     boot)    cmd_boot ;;
     boot-removable) cmd_boot_removable ;;
@@ -271,5 +435,5 @@ case "${1:-}" in
     stop)    cmd_stop ;;
     test)    cmd_test ;;
     test-removable) cmd_test_removable ;;
-    *)       sed -n '2,44p' "$0"; exit 1 ;;
+    *)       sed -n '2,/^set -euo pipefail/p' "$0"; exit 1 ;;
 esac

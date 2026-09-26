@@ -34,6 +34,8 @@
 #   MODE=chr|x86|keep           override the MBR mode flag (default: keep)
 #   INSTALL_MODE=1|2            installer mode for "install": 1 direct
 #                               (default), 2 removable
+#   DEBUG=0|1                   build variant (default 1 in the harness: serial
+#                               console + verbose tracer/probe logs)
 #   MEM=1024  SMP=2             QEMU memory / cpus
 set -euo pipefail
 
@@ -46,6 +48,7 @@ ESP_OFF=1048576                      # partition 1 starts at LBA 2048
 MODE=${MODE:-keep}
 MEM=${MEM:-1024}
 SMP=${SMP:-2}
+DEBUG=${DEBUG:-1}
 
 SERIAL_SOCK=$WORK/serial.sock
 SERIAL_LOG=$WORK/serial.log
@@ -101,7 +104,7 @@ qemu_cmd_removable() {
 cmd_prepare() {
     [ -f "$IMG_SRC" ] || die "source image not found: $IMG_SRC"
     log "== building bootkit"
-    (cd "$ROOT" && ./build.sh)
+    (cd "$ROOT" && DEBUG="$DEBUG" ./build.sh)
 
     mkdir -p "$WORK"
     log "== copying image ($IMG_SRC -> $IMG)"

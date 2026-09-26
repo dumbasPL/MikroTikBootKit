@@ -135,9 +135,11 @@ load on 7.24.4, which is why the bind-mount route replaced it.
 Build:
 
 ```sh
-./build.sh                        # -> ptrace_init (static i386)
+./build.sh                        # production build:
+                                  #    ptrace_init (static i386)
                                   #    bootkit.efi (EFI loader, see bootloader/)
                                   #    bootkit.img (32 MB USB stick image)
+DEBUG=1 ./build.sh                # test build: serial console + verbose logs
 ```
 
 Install: `./build.sh` packs the binary into a cpio and embeds that in the EFI
@@ -179,11 +181,19 @@ file is never touched.
 On boot the loader reads `\BOOTKIT.CFG` next to itself.  It names the ESP
 RouterOS is installed on by the HD() device path identity (signature, start,
 size - not the bus topology); the loader finds that partition and boots
-`\EFI\BOOT\BOOTX64.EFI` from it.  Without a valid config it runs the install
-menu instead: pick the RouterOS ESP, then `direct` (copy the loader + config
-to the target, create the `Boot####` entry) or `removable` (write only
-`\BOOTKIT.CFG` next to the loader, e.g. on a USB stick, and leave the target
-untouched).  `--install` forces the menu.
+`\EFI\BOOT\BOOTX64.EFI` from it.  The `debug=0|1` line in the config
+controls the serial console (`console=ttyS0,115200n8` is appended to the
+kernel command line only with `debug=1`) and the verbosity of the tracer and
+probe logs: production prints only the important probe lines (licence state
+and the three patches) and errors, debug=1 prints every step.  The installer
+writes the build default (`DEBUG=1 ./build.sh` -> `debug=1`); edit the line
+and reboot to switch without rebuilding.
+
+Without a valid config it runs the install menu instead: pick the RouterOS
+ESP, then `direct` (copy the loader + config to the target, create the
+`Boot####` entry) or `removable` (write only `\BOOTKIT.CFG` next to the
+loader, e.g. on a USB stick, and leave the target untouched).  `--install`
+forces the menu.
 
 Booting QEMU's `-kernel BOOTX64.EFI -initrd ... -append rdinit=...` was tried
 first and does not work for this image: the wrapper runs, but the stock init
@@ -246,10 +256,11 @@ image is never touched):
 Environment knobs: `IMG_SRC` (source image, default
 `x86-7.24.4-clean.img`), `WORK` (scratch dir, default `/tmp/opencode/bkvm`),
 `MODE=chr|x86|keep` (override the MBR mode flag), `INSTALL_MODE=1|2` (direct or
-removable), `MEM`, `SMP`.  `vmconsole.py` is the serial helper used by
-`vmtest.sh cmd` (logs in as admin/admin, declines the forced password change
-and runs the command) and by `vmtest.sh install` (`--install <mode>`: picks
-the non-installer ESP, picks the mode, confirms and reboots).
+removable), `DEBUG=0|1` (build variant, harness default 1), `MEM`, `SMP`.
+`vmconsole.py` is the serial helper used by `vmtest.sh cmd` (logs in as
+admin/admin, declines the forced password change and runs the command) and by
+`vmtest.sh install` (`--install <mode>`: picks the non-installer ESP, picks
+the mode, confirms and reboots).
 
 ## 7.24.4 denies PROT_EXEC mmaps of tmpfs files - solved with a bind mount
 

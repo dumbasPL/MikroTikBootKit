@@ -21,6 +21,15 @@ typedef void			VOID;
 #define TRUE 1
 #define FALSE 0
 
+/*
+ * Boot-time debug logging and serial console (see \BOOTKIT.CFG "debug=").
+ * DEBUG=1 ./build.sh changes the default for newly written configs and for
+ * boots with a config that has no debug= line; production builds leave it 0.
+ */
+#ifndef BOOTKIT_DEBUG_DEFAULT
+#define BOOTKIT_DEBUG_DEFAULT 0
+#endif
+
 #define EFIAPI __attribute__((ms_abi))
 #define EFI_PAGE_SIZE 4096
 #define EFI_SIZE_TO_PAGES(n) (((n) + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE)

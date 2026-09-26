@@ -36,6 +36,14 @@ Boot-time tooling for MikroTik RouterOS images.  Two pieces:
   Both end with "press any key to reboot".  `--install` in the load options
   forces the menu even when a valid config exists.
 
+  `DEBUG=1 ./build.sh` makes this a *test build*: new configs get
+  `debug=1`, which adds `console=ttyS0,115200n8 bootkit_debug=1` to the
+  kernel command line and turns on the verbose tracer/probe logs.  The
+  default (production) build writes `debug=0`: no console option and only the
+  important probe lines (licence state, the three patches) plus errors.  The
+  `debug=` line in `\BOOTKIT.CFG` overrides this per boot; edit it to switch
+  either way without rebuilding.
+
 * **`bootkit/`** — an alternative initramfs init (`rdinit=/ptrace_init`)
   (`bootkit/ptrace_init.c`) that ptrace-attaches to the real init and waits
   for it to mount the tmpfs on `/ram`.  As soon as the mount succeeds the
@@ -79,10 +87,12 @@ docs/ptrace-init-preload.md design + findings + verified log
 ## Build
 
 ```sh
-./build.sh                  # -> ./ptrace_init (static i386, ~90 KB with the probe)
-                            #    ./bootkit.efi (EFI application, ~100 KB with the
-                            #    embedded initramfs)
-                            #    ./bootkit.img (32 MB USB stick image of the loader)
+./build.sh                  # production build:
+                            #   ./ptrace_init (static i386, ~90 KB with the probe)
+                            #   ./bootkit.efi (EFI application, ~110 KB with the
+                            #   embedded initramfs)
+                            #   ./bootkit.img (32 MB USB stick image of the loader)
+DEBUG=1 ./build.sh          # test build: serial console + verbose logs
 ```
 
 `bootkit.img` is a 32 MB MBR disk with one FAT EFI system partition (type
@@ -105,8 +115,9 @@ usual build tools (`python3`, `cpio`, `mtools`) only clang and lld are needed.
 The script packs the freshly built `ptrace_init` into a cpio (`initrd.cpio`,
 embedded via the generated `bootloader/initrd_so.h`), so `bootkit.efi` is
 self-contained: only the stock kernel sits next to it on the ESP, plus the
-`Boot####` entry that points at the loader.  The kernel path and command line
-are compile-time constants at the top of `bootloader/boot.c`.
+`Boot####` entry that points at the loader.  The kernel path and the base/debug
+command line fragments are at the top of `bootloader/boot.c`; the `debug=`
+setting in `\BOOTKIT.CFG` picks which fragments are used on each boot.
 
 The LD_PRELOAD probe (bootkit/preload.c) is ordinary C linked without libc
 (-nostdlib): no DT_NEEDED entry, the imports are bound at load time by the
@@ -142,7 +153,9 @@ and restores the target kernel; `./vmtest.sh boot` then starts the target
 normally (through the entry the installer created) and `./vmtest.sh
 test-removable` / `boot-removable` cover the removable mode (stick first,
 bootindex); `./vmtest.sh cmd "<cli command>"` logs into the running VM as
-admin/admin:
+admin/admin.  The harness builds a test build (`DEBUG=1`, override with
+`DEBUG=0`); with a production image `check` shows no tracer/load lines and the
+tracer/probe output only appears after flipping `debug=1` in the config:
 
 ```sh
 # 1. build (ptrace_init, the initramfs and the loader with it embedded)
@@ -213,10 +226,11 @@ Expected installer output (direct mode):
 ```
 efiboot: no valid \BOOTKIT.CFG here, starting the installer
 efiboot: installer mode
+efiboot: debug logging is on (edit debug= in \BOOTKIT.CFG to change)
 efiboot: EFI partitions:
-efiboot:   1) (no label), 32 MB
+efiboot:   1) (no label), 33 MB
 efiboot:      PciRoot(0x0)/Pci(0x4,0x0)/USB(0x0,0x0)/HD(1,MBR,...)
-efiboot:   2) BKINSTALL, 1 MB, this installer
+efiboot:   2) BKINSTALL, 31 MB, this installer
 efiboot:      PciRoot(0x0)/Pci(0x4,0x0)/USB(0x1,0x0)
 efiboot: select the EFI partition where RouterOS is installed [1-2] (q to cancel): 1
 efiboot: installation mode:
@@ -224,7 +238,7 @@ efiboot:   1) direct: copy the loader + config to the target and create the boot
 efiboot:   2) removable: keep the loader here, write only the config (target stays untouched)
 efiboot: select mode [1-2] (q to cancel): 1
 efiboot: boot entry Boot0009 -> \EFI\BOOT\BOOTKIT.EFI
-efiboot: direct install done, copied 103424 bytes to partition 1
+efiboot: direct install done, copied 112640 bytes to partition 1
 efiboot: press any key to reboot
 ```
 
@@ -235,10 +249,12 @@ BdsDxe: loading Boot000N "MikroTikBootKit" ... FilePath(\EFI\BOOT\BOOTKIT.EFI)
 BdsDxe: starting Boot000N "MikroTikBootKit" ...
 efiboot: MikroTik boot kit loader
 efiboot: kernel 5.6.3-64 (gitlab-runner@cicd-a13.mt.lv) #1 SMP ...
-efiboot: initrd 86016 bytes, booting
+efiboot: initrd 94720 bytes, booting (rdinit=/ptrace_init)
+efiboot: initrd 94720 bytes, booting (rdinit=/ptrace_init console=ttyS0,115200n8 bootkit_debug=1)
 ```
+(the second line is with `debug=1`)
 
-Expected tracer output:
+Expected tracer output (with `debug=1`):
 
 ```
 [ptrace-init] tracing pid 1
@@ -303,6 +319,14 @@ when the stored one no longer verifies).
   port still matches; a different disk does not and the menu comes up again.
   The device path text is in a comment line for debugging (and shown in the
   installer listing).
+* `debug=0|1` in the config is read on every boot: 1 appends
+  `console=ttyS0,115200n8 bootkit_debug=1` to the kernel command line (the
+  trace/probe logs become visible on serial) and 1/0 is passed to the
+  initramfs via the command line, so ptrace_init and the probe switch between
+  verbose and important-only logging.  Trade-off: with the serial console off,
+  the kit's messages go to the default console (tty0) and are invisible on
+  serial, but RouterOS's own login still appears there (userspace drives the
+  port).
 * The installer writes the boot entry with the runtime services: it reuses an
   existing `Boot####` for the same file path if there is one, otherwise takes
   the next free number, and prepends it to `BootOrder`.  Variable names in

@@ -1,6 +1,7 @@
 /*
- * config.c - \BOOTKIT.CFG: parse/write the target partition identity and
- * find that partition among the EFI system partitions.
+ * config.c - \BOOTKIT.CFG: parse/write the target partition identity and the
+ * "debug=" switch, and find the target partition among the EFI system
+ * partitions.
  */
 #include "efi.h"
 #include "config.h"
@@ -115,8 +116,56 @@ static BOOLEAN parse_target_id(const char *s, UINTN len, TARGET_ID *id)
 	return TRUE;
 }
 
-static BOOLEAN config_parse(const char *buf, UINTN len, TARGET_ID *id)
+static BOOLEAN name_is(const char *s, UINTN len, const char *key)
 {
+	UINTN i;
+
+	for (i = 0; key[i]; i++) {
+		char a = s[i], b = key[i];
+
+		if (a >= 'A' && a <= 'Z')
+			a += 32;
+		if (i >= len || a != b)
+			return FALSE;
+	}
+	return i < len && s[i] == '=';
+}
+
+static BOOLEAN value_is(const char *s, UINTN len, const char *val)
+{
+	UINTN i;
+
+	for (i = 0; i < len; i++) {
+		char a = s[i], b = val[i];
+
+		if (a >= 'A' && a <= 'Z')
+			a += 32;
+		if (a != b)
+			return FALSE;
+	}
+	return val[i] == 0;
+}
+
+static BOOLEAN parse_bool(const char *s, UINTN len, BOOLEAN *out)
+{
+	if (len == 1 && (s[0] == '0' || s[0] == '1')) {
+		*out = s[0] == '1';
+		return TRUE;
+	}
+	if (value_is(s, len, "no") || value_is(s, len, "off") ||
+	    value_is(s, len, "false"))
+		*out = FALSE;
+	else if (value_is(s, len, "yes") || value_is(s, len, "on") ||
+		 value_is(s, len, "true"))
+		*out = TRUE;
+	else
+		return FALSE;
+	return TRUE;
+}
+
+static BOOLEAN config_parse(const char *buf, UINTN len, TARGET_ID *id, BOOLEAN *debug)
+{
+	BOOLEAN have_target = FALSE;
 	UINTN i = 0;
 
 	while (i < len) {
@@ -133,22 +182,17 @@ static BOOLEAN config_parse(const char *buf, UINTN len, TARGET_ID *id)
 			end--;
 		if (start == end || buf[start] == '#')
 			continue;
-		if (end - start >= 7 &&
-		    (buf[start] == 't' || buf[start] == 'T') &&
-		    (buf[start + 1] == 'a' || buf[start + 1] == 'A') &&
-		    (buf[start + 2] == 'r' || buf[start + 2] == 'R') &&
-		    (buf[start + 3] == 'g' || buf[start + 3] == 'G') &&
-		    (buf[start + 4] == 'e' || buf[start + 4] == 'E') &&
-		    (buf[start + 5] == 't' || buf[start + 5] == 'T') &&
-		    buf[start + 6] == '=') {
+		if (name_is(buf + start, end - start, "target")) {
 			if (parse_target_id(buf + start + 7, end - start - 7, id))
-				return TRUE;
+				have_target = TRUE;
+		} else if (name_is(buf + start, end - start, "debug")) {
+			(void)parse_bool(buf + start + 6, end - start - 6, debug);
 		}
 	}
-	return FALSE;
+	return have_target;
 }
 
-EFI_STATUS config_read(EFI_FILE_PROTOCOL *root, TARGET_ID *id)
+EFI_STATUS config_read(EFI_FILE_PROTOCOL *root, TARGET_ID *id, BOOLEAN *debug)
 {
 	EFI_FILE_PROTOCOL *f;
 	EFI_STATUS status;
@@ -170,7 +214,8 @@ EFI_STATUS config_read(EFI_FILE_PROTOCOL *root, TARGET_ID *id)
 	if (EFI_ERROR(status))
 		return status;
 	buf[len] = 0;
-	if (!config_parse(buf, len, id))
+	*debug = BOOTKIT_DEBUG_DEFAULT;
+	if (!config_parse(buf, len, id, debug))
 		return EFI_INVALID_PARAMETER;
 	return EFI_SUCCESS;
 }
@@ -225,7 +270,7 @@ static UINTN fmt_target_id(char *buf, UINTN cap, const TARGET_ID *id)
 }
 
 EFI_STATUS config_write(EFI_FILE_PROTOCOL *root, const TARGET_ID *id,
-			       EFI_DEVICE_PATH_PROTOCOL *dp)
+			EFI_DEVICE_PATH_PROTOCOL *dp, BOOLEAN debug)
 {
 	EFI_DEVICE_PATH_TO_TEXT_PROTOCOL *d2t = 0;
 	char buf[CONFIG_MAX];
@@ -246,6 +291,9 @@ EFI_STATUS config_write(EFI_FILE_PROTOCOL *root, const TARGET_ID *id,
 	pos = c_append(buf, sizeof(buf), pos, "target=", 7);
 	pos += fmt_target_id(buf + pos, sizeof(buf) - pos - 3, id);
 	pos = c_append(buf, sizeof(buf), pos, "\r\n", 2);
+	/* debug=1 adds the serial console to the kernel cmdline and the verbose
+	 * tracer/probe logs; edit this line to switch at boot time */
+	pos = c_append(buf, sizeof(buf), pos, debug ? "debug=1\r\n" : "debug=0\r\n", 9);
 	return write_file(root, CONFIG_PATH, buf, pos);
 }
 

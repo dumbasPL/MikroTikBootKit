@@ -6,9 +6,13 @@
 #   bootloader/  the EFI loader (efiboot -> bootkit.efi, USB image bootkit.img)
 #
 # Usage: ./build.sh [ptrace_init output]   (default: ./ptrace_init)
+#        DEBUG=1 ./build.sh               # test build: serial console +
+#                                         # verbose tracer/probe logs by default
 set -e
 ROOT=$(cd "$(dirname "$0")" && pwd)
 OUT=${1:-$ROOT/ptrace_init}
+DEBUG=${DEBUG:-0}
+case "$DEBUG" in 0|1) ;; *) echo "ERROR: DEBUG must be 0 or 1" >&2; exit 1 ;; esac
 
 # Prefer musl (tiny static binary); fall back to a multilib host gcc.
 find_cc() {
@@ -47,10 +51,11 @@ if [ -f "$KEYS_ENV" ]; then
     [ -n "${MIKRO_LICENSE_PUBLIC_KEY:-}" ] || MIKRO_LICENSE_PUBLIC_KEY=$(sed -n 's/^MIKRO_LICENSE_PUBLIC_KEY=//p' "$KEYS_ENV" | head -n1)
 fi
 
-DEFS=""
+DEFS="-DBOOTKIT_DEBUG_DEFAULT=$DEBUG"
 [ -n "${CUSTOM_LICENSE_PUBLIC_KEY:-}" ] && DEFS="$DEFS -DKEYGEN_LICENSE_PUBLIC_HEX=\"$CUSTOM_LICENSE_PUBLIC_KEY\""
 [ -n "${CUSTOM_LICENSE_PRIVATE_KEY:-}" ] && DEFS="$DEFS -DKEYGEN_LICENSE_PRIVATE_HEX=\"$CUSTOM_LICENSE_PRIVATE_KEY\""
 [ -n "${MIKRO_LICENSE_PUBLIC_KEY:-}" ] && DEFS="$DEFS -DSTOCK_LICENSE_PUBLIC_HEX=\"$MIKRO_LICENSE_PUBLIC_KEY\""
+echo "== build: DEBUG=$DEBUG (1 = serial console + verbose tracer/probe logs)"
 echo "== probe keys: custom ${CUSTOM_LICENSE_PUBLIC_KEY:-<keygen.c default>}, stock ${MIKRO_LICENSE_PUBLIC_KEY:-<built-in default>}"
 
 # shellcheck disable=SC2086
@@ -73,7 +78,7 @@ PY
 
 # 3. ptrace_init itself
 # shellcheck disable=SC2086
-$CC -static -Os -Wall -o "$OUT" "$ROOT/bootkit/ptrace_init.c"
+$CC -static -Os -Wall -DBOOTKIT_DEBUG_DEFAULT="$DEBUG" -o "$OUT" "$ROOT/bootkit/ptrace_init.c"
 echo "built: $OUT ($(wc -c < "$OUT") bytes), preload.so ($(wc -c < "$ROOT/bootkit/preload.so") bytes)"
 
 # 4. the initramfs (the just-built ptrace_init alone, cpio/newc) and its
@@ -108,6 +113,7 @@ if ! command -v clang >/dev/null 2>&1; then
 fi
 clang --target=x86_64-unknown-windows -ffreestanding -fno-stack-protector \
     -mno-red-zone -mno-sse -fshort-wchar -Os -Wall -Wextra -nostdlib \
+    -DBOOTKIT_DEBUG_DEFAULT="$DEBUG" \
     -fuse-ld=lld-link \
     -Wl,/subsystem:efi_application,/entry:efi_main,/nodefaultlib \
     -o "$ROOT/bootkit.efi" \

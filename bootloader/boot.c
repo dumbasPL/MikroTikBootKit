@@ -1,18 +1,38 @@
 /*
  * boot.c - load \EFI\BOOT\BOOTX64.EFI from an ESP and enter it through the
- * x86 EFI handover protocol with the initramfs embedded in this image.
+ * x86 EFI handover protocol with the initramfs embedded in this image.  The
+ * kernel command line is "rdinit=/ptrace_init", plus the serial console and
+ * the bootkit_debug marker when the config's debug= is on.
  */
 #include "efi.h"
 #include "bootabi.h"
 #include "boot.h"
 #include "initrd_so.h"
 
-/* compile-time configuration */
-#define KERNEL_PATH	L"\\EFI\\BOOT\\BOOTX64.EFI"
-#define KERNEL_CMDLINE	"console=ttyS0,115200n8 rdinit=/ptrace_init"
+/* compile-time configuration; the serial console and the verbose tracer/probe
+ * logs are enabled by "debug=1" in \BOOTKIT.CFG (default BOOTKIT_DEBUG_DEFAULT,
+ * set by DEBUG=1 ./build.sh) */
+#define KERNEL_PATH		L"\\EFI\\BOOT\\BOOTX64.EFI"
+#define KERNEL_CMDLINE_BASE	"rdinit=/ptrace_init"
+#define KERNEL_CMDLINE_DEBUG	" console=ttyS0,115200n8 bootkit_debug=1"
 
 /* kept out of the stack frame: >4 KiB frames need a __chkstk probe */
 static UINT8 first_page[4096];
+
+/* base + optional debug options, NUL terminated; returns bytes incl. NUL */
+static UINTN build_cmdline(char *buf, UINTN cap, BOOLEAN debug)
+{
+	const char *s;
+	UINTN n = 0;
+
+	for (s = KERNEL_CMDLINE_BASE; *s && n < cap - 1; s++)
+		buf[n++] = *s;
+	if (debug)
+		for (s = KERNEL_CMDLINE_DEBUG; *s && n < cap - 1; s++)
+			buf[n++] = *s;
+	buf[n] = 0;
+	return n + 1;
+}
 
 static VOID print_kernel_version(const UINT8 *kbuf, UINTN klen)
 {
@@ -35,16 +55,17 @@ static VOID print_kernel_version(const UINT8 *kbuf, UINTN klen)
 	}
 }
 
-EFI_STATUS boot_from_root(EFI_HANDLE image, EFI_FILE_PROTOCOL *root)
+EFI_STATUS boot_from_root(EFI_HANDLE image, EFI_FILE_PROTOCOL *root, BOOLEAN debug)
 {
 	struct SetupHeader hdr;
 	struct BootParams *params;
 	EFI_FILE_PROTOCOL *f;
 	EFI_PHYSICAL_ADDRESS addr;
 	EFI_STATUS status;
-	UINTN setup_sects, setup_total, kalloc;
+	UINTN setup_sects, setup_total, kalloc, cmd_len;
 	UINT64 kfile_size, kneed, klen, ilen;
 	UINT8 *kbuf = 0, *ibuf = 0;
+	char cmdline[96];
 	CHAR16 *cmd;
 	handover_fn handover;
 
@@ -133,19 +154,30 @@ EFI_STATUS boot_from_root(EFI_HANDLE image, EFI_FILE_PROTOCOL *root)
 	params->ext_ramdisk_size = (UINT32)(ilen >> 32);
 
 	cmd = (CHAR16 *)0;
-	status = alloc_pages(EfiLoaderData, sizeof(KERNEL_CMDLINE), 0xa0000ULL, (VOID **)&cmd);
+	cmd_len = build_cmdline(cmdline, sizeof(cmdline), debug);
+	status = alloc_pages(EfiLoaderData, cmd_len, 0xa0000ULL, (VOID **)&cmd);
 	if (EFI_ERROR(status))
-		status = alloc_pages(EfiLoaderData, sizeof(KERNEL_CMDLINE), 0xffffffffULL,
+		status = alloc_pages(EfiLoaderData, cmd_len, 0xffffffffULL,
 				    (VOID **)&cmd);
 	if (EFI_ERROR(status))
 		return fail(status, L"cannot allocate the command line");
-	memcpy(cmd, KERNEL_CMDLINE, sizeof(KERNEL_CMDLINE));
+	memcpy(cmd, cmdline, cmd_len);
 	params->hdr.cmd_line_ptr = (UINT32)(UINTN)cmd;
 	params->ext_cmd_line_ptr = (UINT32)((UINT64)(UINTN)cmd >> 32);
 
 	print(L"efiboot: initrd ");
 	print_dec(ilen);
-	print(L" bytes, booting\r\n");
+	print(L" bytes, booting (");
+	{
+		CHAR16 cmdw[96];
+		UINTN ci;
+
+		for (ci = 0; cmdline[ci] && ci < sizeof(cmdw) / sizeof(cmdw[0]) - 1; ci++)
+			cmdw[ci] = (CHAR16)cmdline[ci];
+		cmdw[ci] = 0;
+		print(cmdw);
+	}
+	print(L")\r\n");
 
 	/*
 	 * EFI handover entry: 32-bit handover_offset from the start of the

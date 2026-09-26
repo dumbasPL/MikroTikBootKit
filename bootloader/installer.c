@@ -43,6 +43,9 @@ EFI_STATUS installer_run(EFI_HANDLE image, EFI_LOADED_IMAGE_PROTOCOL *li)
 	EFI_DEVICE_PATH_PROTOCOL *target_dp = 0;
 
 	print(L"efiboot: installer mode\r\n");
+	print(L"efiboot: debug logging is ");
+	print(BOOTKIT_DEBUG_DEFAULT ? L"on" : L"off");
+	print(L" (edit debug= in " CONFIG_PATH L" to change)\r\n");
 
 	if (!ST->ConIn)
 		return fail(EFI_UNSUPPORTED, L"no console input available");
@@ -207,7 +210,7 @@ EFI_STATUS installer_run(EFI_HANDLE image, EFI_LOADED_IMAGE_PROTOCOL *li)
 		if (EFI_ERROR(status) || size64 != src_len)
 			return fail(EFI_DEVICE_ERROR, L"installed file size mismatch");
 
-		status = config_write(root, &target_id, target_dp);
+		status = config_write(root, &target_id, target_dp, BOOTKIT_DEBUG_DEFAULT);
 		if (EFI_ERROR(status))
 			return fail(status, L"cannot write " CONFIG_PATH);
 		status = boot_entry_add(handles[choice - 1], L"\\EFI\\BOOT\\BOOTKIT.EFI");
@@ -225,7 +228,7 @@ EFI_STATUS installer_run(EFI_HANDLE image, EFI_LOADED_IMAGE_PROTOCOL *li)
 		status = open_root(image, &cur_root);
 		if (EFI_ERROR(status))
 			return fail(status, L"cannot open my own volume");
-		status = config_write(cur_root, &target_id, target_dp);
+		status = config_write(cur_root, &target_id, target_dp, BOOTKIT_DEBUG_DEFAULT);
 		cur_root->Close(cur_root);
 		if (EFI_ERROR(status))
 			return fail(status, L"cannot write " CONFIG_PATH);

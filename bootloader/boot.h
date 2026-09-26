@@ -5,6 +5,6 @@
 
 #include "efi.h"
 
-EFI_STATUS boot_from_root(EFI_HANDLE image, EFI_FILE_PROTOCOL *root);
+EFI_STATUS boot_from_root(EFI_HANDLE image, EFI_FILE_PROTOCOL *root, BOOLEAN debug);
 
 #endif /* EFIBOOT_BOOT_H */

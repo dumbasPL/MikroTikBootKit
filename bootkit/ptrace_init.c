@@ -20,11 +20,18 @@
  * Only the init is traced (no fork following): it is the process that mounts
  * the tmpfs on /ram, early in boot_stage_mount_system(), long before
  * sysinit/mode/loader exist.  Every dynamically linked binary started after
- * that point loads the probe and its constructor prints the binary's name to
- * /dev/console.
+ * that point loads the probe; with debug=1 its constructor prints the
+ * binary's name to /dev/console.
+ *
+ * Logging and the serial console are controlled at boot time by the
+ * bootloader's debug= setting (\BOOTKIT.CFG): it adds bootkit_debug=1 to the
+ * kernel command line and console=ttyS0,115200n8.  Production (debug=0)
+ * prints only errors here and only the important licence/patch lines in the
+ * probe; debug=1 prints every step.  DEBUG=1 ./build.sh sets the default for
+ * newly installed configs.
  *
  * Details, and the target behaviours this relies on: docs/ptrace-init-preload.md
- * Build: ./build.sh
+ * Build: ./build.sh      (DEBUG=1 for a test build)
  */
 
 #define _GNU_SOURCE
@@ -42,6 +49,7 @@
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 
 extern char **environ;
 
@@ -104,20 +112,24 @@ struct syscall_info {
  * instead of being written onto the tmpfs. */
 #define PRELOAD_SRC       "/ptrace_init.so"
 
+/* verbose logging default, overridden by the bootloader's debug= setting */
+#ifndef BOOTKIT_DEBUG_DEFAULT
+#define BOOTKIT_DEBUG_DEFAULT 0
+#endif
+
+static int g_verbose = BOOTKIT_DEBUG_DEFAULT;
+
 /* ----------------------------------------------------------------- logging */
 
 /* one write per line, so messages from the tracer and the probe do not
  * interleave on the console */
-static void logmsg(const char *fmt, ...)
+static void logv(const char *fmt, va_list ap)
 {
 	char buf[640];
-	va_list ap;
 	int n, fd;
 
 	memcpy(buf, "[ptrace-init] ", 14);
-	va_start(ap, fmt);
 	n = vsnprintf(buf + 14, sizeof(buf) - 14, fmt, ap);
-	va_end(ap);
 	if (n < 0)
 		return;
 	if (n > (int)sizeof(buf) - 16)
@@ -130,6 +142,69 @@ static void logmsg(const char *fmt, ...)
 	write(fd, buf, (size_t)(14 + n));
 	if (fd != 2)
 		close(fd);
+}
+
+/* informational, only with boot-time debug=1 (see \BOOTKIT.CFG) */
+static void logmsg(const char *fmt, ...)
+{
+	va_list ap;
+
+	if (!g_verbose)
+		return;
+	va_start(ap, fmt);
+	logv(fmt, ap);
+	va_end(ap);
+}
+
+/* errors are always printed */
+static void logerr(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	logv(fmt, ap);
+	va_end(ap);
+}
+
+/*
+ * The bootloader appends bootkit_debug=1 to the kernel command line when the
+ * config says debug=1.  /proc is not mounted yet when we start, so mount a
+ * private one, read the command line and take it down again.  Returns 0/1,
+ * or -1 when the command line cannot be read (use the build default then).
+ */
+static int read_boot_debug(void)
+{
+	static const char marker[] = "bootkit_debug=1";
+	char buf[2048];
+	int fd, n, r = -1;
+
+	fd = open("/proc/cmdline", O_RDONLY);
+	if (fd >= 0) {
+		n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n > 0) {
+			buf[n] = 0;
+			return strstr(buf, marker) != NULL;
+		}
+		return -1;
+	}
+
+	if (mkdir("/bootkit-proc", 0755) != 0 && errno != EEXIST)
+		return -1;
+	if (mount("proc", "/bootkit-proc", "proc", 0, NULL) != 0)
+		return -1;
+	fd = open("/bootkit-proc/cmdline", O_RDONLY);
+	if (fd >= 0) {
+		n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n > 0) {
+			buf[n] = 0;
+			r = strstr(buf, marker) != NULL;
+		}
+	}
+	umount("/bootkit-proc");
+	rmdir("/bootkit-proc");
+	return r;
 }
 
 /* ------------------------------------------------------ tracee memory I/O */
@@ -212,7 +287,7 @@ static int touch_file(const char *path)
 static void stash_preload(void)
 {
 	if (write_preload(PRELOAD_SRC) != 0)
-		logmsg("cannot stash %s: %s", PRELOAD_SRC, strerror(errno));
+		logerr("cannot stash %s: %s", PRELOAD_SRC, strerror(errno));
 }
 
 /* tmpfs was mounted on /ram: make the probe available at PRELOAD_PATH by
@@ -223,17 +298,17 @@ static void drop_preload(void)
 	char src[64];
 
 	if (touch_file(PRELOAD_PATH) != 0) {
-		logmsg("cannot create %s: %s", PRELOAD_PATH, strerror(errno));
+		logerr("cannot create %s: %s", PRELOAD_PATH, strerror(errno));
 		return;
 	}
 	if (stash_fd < 0) {
-		logmsg("%s is not open, cannot bind %s", PRELOAD_SRC,
+		logerr("%s is not open, cannot bind %s", PRELOAD_SRC,
 		       PRELOAD_PATH);
 		return;
 	}
 	snprintf(src, sizeof(src), "/proc/self/fd/%d", stash_fd);
 	if (mount(src, PRELOAD_PATH, NULL, MS_BIND, NULL) != 0)
-		logmsg("cannot bind %s -> %s: %s", src, PRELOAD_PATH,
+		logerr("cannot bind %s -> %s: %s", src, PRELOAD_PATH,
 		       strerror(errno));
 	else
 		logmsg("bind-mounted %s -> %s, detaching", src, PRELOAD_PATH);
@@ -255,7 +330,7 @@ static void tracer_main(pid_t parent, int ready_fd)
 	int root_armed = 0;	/* mount("tmpfs", "/newroot") seen */
 
 	if (ptrace(PTRACE_SEIZE, parent, 0, (void *)opts) < 0) {
-		logmsg("PTRACE_SEIZE(%d) failed: %s", (int)parent,
+		logerr("PTRACE_SEIZE(%d) failed: %s", (int)parent,
 		       strerror(errno));
 		if (ready_fd >= 0) {
 			char c = 'x';
@@ -279,7 +354,7 @@ static void tracer_main(pid_t parent, int ready_fd)
 		if (waitpid(parent, &status, __WALL) < 0) {
 			if (errno == EINTR)
 				continue;
-			logmsg("waitpid: %s", errno == ECHILD ?
+			logerr("waitpid: %s", errno == ECHILD ?
 			       "init is gone" : strerror(errno));
 			return;
 		}
@@ -338,7 +413,7 @@ static void tracer_main(pid_t parent, int ready_fd)
 						if (chdir("/newroot") != 0 ||
 						    chroot(".") != 0 ||
 						    chdir("/") != 0)
-							logmsg("cannot follow into /newroot: %s",
+							logerr("cannot follow into /newroot: %s",
 							       strerror(errno));
 						else
 							logmsg("following the init into /newroot");
@@ -353,7 +428,7 @@ static void tracer_main(pid_t parent, int ready_fd)
 						finish(parent);
 						return;
 					}
-					logmsg("pid %d: mount(tmpfs, /ram) failed: %lld",
+					logerr("pid %d: mount(tmpfs, /ram) failed: %lld",
 					       (int)parent, rv);
 				}
 			}
@@ -376,9 +451,19 @@ static void init_main(int argc, char **argv)
 
 	/* would re-exec ourselves forever */
 	if (argc > 0 && argv && argv[0] && !strcmp(argv[0], REAL_INIT)) {
-		logmsg("started as %s, halting", REAL_INIT);
+		logerr("started as %s, halting", REAL_INIT);
 		for (;;)
 			pause();
+	}
+
+	/* boot-time debug= setting (kernel command line), and pass it down to
+	 * the probe in the environment of the stock init and its children */
+	{
+		int dbg = read_boot_debug();
+
+		if (dbg >= 0)
+			g_verbose = dbg;
+		setenv("BOOTKIT_DEBUG", g_verbose ? "1" : "0", 1);
 	}
 
 	stash_preload();
@@ -387,10 +472,10 @@ static void init_main(int argc, char **argv)
 	 * does not leak into RouterOS */
 	stash_fd = open(PRELOAD_SRC, O_RDONLY | O_CLOEXEC);
 	if (stash_fd < 0)
-		logmsg("cannot open %s: %s", PRELOAD_SRC, strerror(errno));
+		logerr("cannot open %s: %s", PRELOAD_SRC, strerror(errno));
 
 	if (pipe(fds) != 0) {
-		logmsg("pipe: %s", strerror(errno));
+		logerr("pipe: %s", strerror(errno));
 		fds[0] = fds[1] = -1;
 	}
 	t = fork();
@@ -418,7 +503,7 @@ static void init_main(int argc, char **argv)
 	/* put the preload into the environment the stock init inherits */
 	setenv("LD_PRELOAD", PRELOAD_PATH, 1);
 	execve(REAL_INIT, (char *[]){ (char *)REAL_INIT, NULL }, environ);
-	logmsg("execve(%s): %s, halting", REAL_INIT, strerror(errno));
+	logerr("execve(%s): %s, halting", REAL_INIT, strerror(errno));
 	for (;;)
 		pause();
 }

@@ -1,7 +1,8 @@
 /*
  * efi_main.c - the loader entry point: read \BOOTKIT.CFG from the volume we
- * were booted from, boot the configured RouterOS ESP, or run the install menu
- * when there is no usable config (--install forces the menu).
+ * were booted from, boot the configured RouterOS ESP (passing its debug=
+ * setting on to the kernel command line), or run the install menu when there
+ * is no usable config (--install forces the menu).
  */
 #include "efi.h"
 #include "config.h"
@@ -27,6 +28,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
 	EFI_LOADED_IMAGE_PROTOCOL *li = 0;
 	EFI_FILE_PROTOCOL *root;
 	TARGET_ID target;
+	BOOLEAN debug;
 	EFI_STATUS status;
 
 	ST = st;
@@ -52,7 +54,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
 	status = open_root(image, &root);
 	if (EFI_ERROR(status))
 		return fail(status, L"cannot open the boot volume");
-	status = config_read(root, &target);
+	status = config_read(root, &target, &debug);
 	if (EFI_ERROR(status)) {
 		print(L"efiboot: no valid " CONFIG_PATH L" here, starting the installer\r\n");
 	} else {
@@ -62,7 +64,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
 		if (EFI_ERROR(status))
 			print(L"efiboot: the configured target partition was not found\r\n");
 		else
-			return boot_from_root(image, target_root);
+			return boot_from_root(image, target_root, debug);
 	}
 	return installer_run(image, li);
 }

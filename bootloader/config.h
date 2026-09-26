@@ -2,7 +2,8 @@
 #define EFIBOOT_CONFIG_H
 
 /*
- * config.h - \BOOTKIT.CFG: the partition RouterOS is installed on.
+ * config.h - \BOOTKIT.CFG: the partition RouterOS is installed on, and the
+ * boot-time "debug=" switch (serial console + verbose tracer/probe logs).
  */
 
 #include "efi.h"
@@ -24,9 +25,9 @@ typedef struct {
 
 BOOLEAN target_id_from_dp(EFI_DEVICE_PATH_PROTOCOL *dp, TARGET_ID *id);
 BOOLEAN target_id_equal(const TARGET_ID *a, const TARGET_ID *b);
-EFI_STATUS config_read(EFI_FILE_PROTOCOL *root, TARGET_ID *id);
+EFI_STATUS config_read(EFI_FILE_PROTOCOL *root, TARGET_ID *id, BOOLEAN *debug);
 EFI_STATUS config_write(EFI_FILE_PROTOCOL *root, const TARGET_ID *id,
-			EFI_DEVICE_PATH_PROTOCOL *dp);
+			EFI_DEVICE_PATH_PROTOCOL *dp, BOOLEAN debug);
 EFI_STATUS find_target_root(const TARGET_ID *id, EFI_FILE_PROTOCOL **out);
 
 #endif /* EFIBOOT_CONFIG_H */

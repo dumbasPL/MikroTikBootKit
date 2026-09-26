@@ -7,8 +7,12 @@
  * already present in the process (RouterOS's /lib/libc.so) when the library
  * is preloaded.
  *
- * When it is loaded, its ELF constructor writes one line to /dev/console
- * naming the executable that loaded it.  On top of that:
+ * The boot-time "debug=" setting in \BOOTKIT.CFG (passed down as
+ * BOOTKIT_DEBUG by ptrace_init) decides how much is logged.  In production
+ * (debug=0) only the important lines are printed to /dev/console: the
+ * licence state and the three in-memory patches plus errors.  With debug=1
+ * the constructor also logs one line per process loaded, naming the
+ * executable and its pid.  On top of that:
  *
  *   /nova/bin/mode    the embedded keygen (keygen.c, an embeddable copy of
  *                     MikroTikPatch's) generates and signs the licence blob
@@ -23,7 +27,7 @@
  *                     ends in memcmp(hash, witness) == 0, so it accepts any
  *                     blob and never flags the custom licence.  The loader's
  *                     text and key material are left untouched.
- *   everything else   only the console line.
+ *   everything else   nothing (debug=1: only the console line)
  *
  * The in-memory patch is the runtime equivalent of MikroTikPatch's
  * ReplaceKeyArch(): the x86 binaries store the 32-byte public key as eight
@@ -51,7 +55,29 @@
 #include "keygen.c"
 
 #include <stdarg.h>
+#include <stdlib.h>
 #include <sys/mman.h>
+
+/*
+ * Verbose per-process logging (the "loaded by" line) is off in production
+ * builds; ptrace_init passes the boot-time "debug=" setting in the
+ * BOOTKIT_DEBUG environment variable, the build sets the fallback.
+ */
+#ifndef BOOTKIT_DEBUG_DEFAULT
+#define BOOTKIT_DEBUG_DEFAULT 0
+#endif
+
+static int verbose_log(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("BOOTKIT_DEBUG");
+
+		v = e ? (e[0] == '1') : BOOTKIT_DEBUG_DEFAULT;
+	}
+	return v;
+}
 
 /* The stock RouterOS licence public key, as MIKRO_LICENSE_PUBLIC_KEY in
  * MikroTikPatch's keys.env; build.sh overrides it when the file is present. */
@@ -525,8 +551,9 @@ static void preload_init(void)
 	base = strrchr(exe, '/');
 	base = (base != NULL) ? base + 1 : exe;
 
-	console_log("[ldpreload] loaded by %s (pid=%d)\n", exe,
-		    (int)getpid());
+	if (verbose_log())
+		console_log("[ldpreload] loaded by %s (pid=%d)\n", exe,
+			    (int)getpid());
 
 	if (strcmp(base, "mode") == 0) {
 		int hits = patch_licence_key(exe);

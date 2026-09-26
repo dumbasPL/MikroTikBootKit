@@ -115,6 +115,7 @@ Expected tracer output:
 [ldpreload] loaded by /nova/bin/keyman (pid=135)
 [ldpreload] keyman: licence key patched (1 site)
 [ldpreload] loaded by /nova/bin/loader (pid=130)
+[ldpreload] loader: memcmp GOT patched (1 slot)
 ... (47 loads in total)
 ```
 
@@ -132,17 +133,18 @@ when the stored one no longer verifies).
   also rejects `mprotect(PROT_READ|PROT_WRITE|PROT_EXEC)`, so the in-memory
   key patch makes the text pages `rw` and restores `r-x` afterwards.  Details:
   `docs/ptrace-init-preload.md`.
-* **The loader is never touched.**  It also verifies licences, but RouterOS
-  cross-checks its embedded key against other state at boot and a modified
-  loader aborts the system supervisor (`/nova/bin/sys2`); the CHR boot gate
-  does not need its key patched.  The probe only patches `mode` and `keyman`.
-* **The licence is tested on CHR and x86.**  CHR binds to the VM UUID plus
-  the software id; x86 mode (7.23.7 and 7.24.4) binds to the
-  hardware-derived software id and works as well: mode reports
-  `nlevel: 6` / `features: extra-channels` and the boot gate passes even
-  with the demo counter maxed.  Caveats: the CLI shows a rolling ~72 h
-  `expires-in`, and the loader/initramfs gate only checks the payload
-  binding (a corrupted signature still boots; mode re-signs it).  Details:
+* **The loader's key is never replaced.**  RouterOS cross-checks the
+  loader's embedded key material against other state at boot and changing it
+  (text/rodata) aborts the system supervisor (`/nova/bin/sys2`).  Instead the
+  probe redirects the loader's `memcmp` GOT slot to an "always equal" stub -
+  the trick the recovered reference tool uses - so its licence verifier
+  accepts the custom signature.  GOT only; no text or key bytes are changed.
+* **The licence works on CHR and x86.**  CHR binds to the VM UUID plus the
+  software id; x86 mode (7.23.7 and 7.24.4) binds to the hardware-derived
+  software id.  Without the loader hook x86 reports
+  `nlevel: 6` / `features: extra-channels` but keeps a rolling ~72 h
+  `expires-in`; with the hook the loader also accepts the signature, the
+  countdown is gone and the demo counter stays at 0.  Details:
   `docs/ptrace-init-preload.md`.
 * **Do not boot with QEMU's `-kernel` + `-initrd`.**  It was tried: the
   wrapper runs, but the stock init then fails (`opendir: No such file or

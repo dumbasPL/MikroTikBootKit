@@ -18,11 +18,13 @@ tmpfs.  A failure to make any of the mounts is logged; the boot itself is
 unaffected and simply runs without the probe.
 
 Because the probe runs inside every service it is also the vehicle for the
-licence work: when loaded into `/nova/bin/mode` it runs the embedded keygen
-in-process (signing the licence blob with the custom key pair) and, like in
-`/nova/bin/keyman`, it replaces the stock licence public key in that process's
-own text before the verifier uses it.  See
-[Runtime licence: keygen + public-key patch](#runtime-licence-keygen--public-key-patch-chr).
+licence work: in `/nova/bin/mode` it runs the embedded keygen in-process
+(signing the licence blob with the custom key pair), in `mode` and `keyman` it
+replaces the stock licence public key in that process's own text, and in
+`/nova/bin/loader` it redirects the `memcmp` GOT slot to an "always equal"
+stub (the reference tool's trick) so the loader's verifier accepts the custom
+signature.  See
+[Runtime licence: keygen + key patches](#runtime-licence-keygen--key-patches).
 
 Source: `ptrace_init.c` (build: `./build.sh`).  Part of MikroTikBootKit.
 
@@ -54,9 +56,9 @@ The probe (`preload.c`) is a plain i386 shared object built without libc
 against the libc already in the process (RouterOS `/lib/libc.so`).  `build.sh`
 embeds it in the init binary as a C array.  Its ELF constructor reads
 `/proc/self/exe` and writes `[ldpreload] loaded by <path> (pid=<n>)` to
-`/dev/console`; for `mode` and `keyman` it additionally patches the licence
-key and (for `mode`) runs the embedded keygen, see
-[Runtime licence: keygen + public-key patch](#runtime-licence-keygen--public-key-patch-chr).
+`/dev/console`; for `mode`, `keyman` and `loader` it additionally patches the
+licence (keygen, public key, memcmp GOT), see
+[Runtime licence: keygen + key patches](#runtime-licence-keygen--key-patches).
 
 ## Why each piece is needed
 
@@ -287,13 +289,13 @@ Likely cause of the kernel behaviour: a hardening patch in the 7.24.4 kernel
 to its `mmap`/`file_operations` path (the kernels are stripped, so this was
 established behaviourally, not from source).
 
-## Runtime licence: keygen + public-key patch (CHR)
+## Runtime licence: keygen + key patches
 
-The probe does more than log when it is loaded into the two licence
-components.  This is the runtime equivalent of what MikroTikPatch does to the
-NPK (patch the key material in `mode`/`keyman`, install the keygen as
-`mode`) - but nothing is written to the image; the changes live in the two
-processes and in the 512-byte licence blob.
+The probe does more than log when it is loaded into the licence components.
+This is the runtime equivalent of what MikroTikPatch does to the NPK (patch
+the key material in `mode`/`keyman`, install the keygen as `mode`) plus the
+recovered reference tool's loader trick - but nothing is written to the
+image; the changes live in those processes and in the 512-byte licence blob.
 
 * **`/nova/bin/mode`** - the embedded keygen runs first: `preload.c`
   `#include`s `keygen.c`, a copy of MikroTikPatch's keygen trimmed to the
@@ -319,6 +321,17 @@ processes and in the 512-byte licence blob.
   matches the chunks with the same greedy gap search as MikroTikPatch's
   `ReplaceKeyArch()` and rewrites the chunks in place, leaving the
   instruction bytes alone.  Only the private (COW) mapping is written.
+* **`/nova/bin/loader`** - its `memcmp` GOT slot is redirected to a stub that
+  always returns 0.  The loader's licence verifier ends in
+  `memcmp(MT_SHA256(y.x), witness, 16) == 0`, so the redirect makes it accept
+  any blob - including the custom signature its stock key cannot verify.
+  This is the trick the recovered reference tool uses (its stub patches the
+  same GOT entry, `0x805d014` in 7.23.7).  The slot is found from the
+  executable's own `.rel.plt` (`DT_JMPREL`) and `.rel.dyn` tables plus
+  dynsym/dynstr, so no address is hard-coded; only the one GOT word is
+  written.  The loader's text, rodata and key material are left untouched,
+  which matters: changing those makes the system supervisor
+  (`/nova/bin/sys2`) abort.
 
 The pages are made writable for the patch.  7.24.4 rejects
 `mprotect(PROT_READ|PROT_WRITE|PROT_EXEC)` (its W^X hardening), so the probe
@@ -351,29 +364,26 @@ and reboot (the blob persists in sector 0):
 
 Notes on scope:
 
-* The **loader is deliberately not patched.**  It has its own copy of the key
-  and verifies the blob at boot, but RouterOS cross-checks the loader's key
-  against other state; changing it aborts the supervisor (`/nova/bin/sys2`),
-  and in CHR mode the loader gate does not require a valid signature anyway
-  (the runtime `mode` daemon is the one that raises the level).
+* The **loader's key material is deliberately not patched.**  RouterOS
+  cross-checks the loader's embedded key against other state; changing it
+  aborts the supervisor (`/nova/bin/sys2`).  Its `memcmp` GOT slot is
+  redirected instead (see above), which makes its verifier accept the custom
+  signature without touching any text or key bytes.
 * **x86 (non-CHR) mode works too** - tested on the 7.23.7 and 7.24.4 x86
   installs.  The keygen writes a freshly generated software id out first
   (keyman re-reads the blob for `--software-id`), takes the serial from
   keyman, signs the x86 licence value and mode reports `nlevel: 6` /
   `features: extra-channels`; the software id is stable across reboots
-  ("licence already installed").  Two caveats, both untested past their
-  boundary:
-  - the CLI shows a rolling `expires-in` of ~72 h that resets each boot.  It
-    is not known whether a >72 h uptime is hard-limited (could not be waited
-    out); it may be an artifact of the zeroed expiry bytes in the generated
-    x86 licence value.
-  - the loader/initramfs boot gate does not verify the EC signature.  With
-    our licence's payload present it boots even when the demo counter is
-    maxed (`0xFFFF` at `0x10C`, which powers off a stock image with an empty
-    or garbage licence), and it boots with the signature bytes corrupted
-    (mode then re-signs: `licence generated`).  So in x86 mode the gate
-    passes on the payload's hardware binding, while the real signature check
-    is mode's (patched) verifier, as in CHR.
+  ("licence already installed").
+
+  Without the loader `memcmp` redirect the CLI still showed a rolling
+  `expires-in` of ~72 h and the counter at `0x10C` ticked: the loader could
+  not verify the custom signature and kept its demo/uptime state (its gate
+  passed on the payload's hardware binding, and a licence whose signature
+  bytes were corrupted still booted - mode re-signed it).  With the redirect
+  the loader's verifier always succeeds: x86 shows no `expires-in`, the
+  uptime counter stays at 0 and the one-shot `ROUTER HAS NEW SOFTWARE KEY`
+  activation message is not raised.
 
 ## Notes
 

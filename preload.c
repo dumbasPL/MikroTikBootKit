@@ -17,10 +17,13 @@
  *                     memory, so mode accepts the licence and raises the
  *                     level to 6.
  *   /nova/bin/keyman  the licence public key is replaced in memory too.
- *   everything else   only the console line.  In particular the loader is
- *                     never touched: RouterOS cross-checks its embedded key
- *                     against other state at boot and a modified loader
- *                     aborts the system supervisor (/nova/bin/sys2).
+ *   /nova/bin/loader  the memcmp GOT slot is redirected to a stub that
+ *                     always returns 0 (the same trick the recovered
+ *                     reference tool uses): the loader's licence verifier
+ *                     ends in memcmp(hash, witness) == 0, so it accepts any
+ *                     blob and never flags the custom licence.  The loader's
+ *                     text and key material are left untouched.
+ *   everything else   only the console line.
  *
  * The in-memory patch is the runtime equivalent of MikroTikPatch's
  * ReplaceKeyArch(): the x86 binaries store the 32-byte public key as eight
@@ -230,6 +233,260 @@ next:
 	return hits;
 }
 
+/* ------------------------------------------------- memcmp PLT/GOT redirect */
+
+/*
+ * The loader's calls to memcmp are redirected to a stub that always reports
+ * "equal".  This is what the recovered reference tool does (its stub patches
+ * the loader's memcmp GOT entry, 0x805d014 in 7.23.7): the loader's licence
+ * verifier ends in `memcmp(hash, witness, 16) == 0`, and forcing it true makes
+ * the verifier accept any blob, so the loader never flags the custom-signed
+ * licence.  The GOT slot is found from the executable's own PLT/JMP relocs
+ * (dynsym/dynstr), so no hard-coded address is needed.
+ *
+ * The redirect is per-process (only the loader's GOT slot is written) and the
+ * stub is a private symbol, so every other binary keeps the libc memcmp.
+ */
+
+/* the loader's memcmp calls land here: everything compares "equal" */
+static int stub_memcmp(const void *a, const void *b, size_t n)
+{
+	(void)a;
+	(void)b;
+	(void)n;
+	return 0;
+}
+
+typedef struct {
+	unsigned char ident[16];
+	unsigned short type, machine;
+	unsigned int version, entry, phoff, shoff, flags;
+	unsigned short ehsize, phentsize, phnum, shentsize, shnum, shstrndx;
+} __attribute__((packed)) elf32_ehdr;
+
+typedef struct {
+	unsigned int type, offset, vaddr, paddr, filesz, memsz, flags, align;
+} __attribute__((packed)) elf32_phdr;
+
+typedef struct { unsigned int tag, val; } __attribute__((packed)) elf32_dyn;
+typedef struct { unsigned int offset, info; } __attribute__((packed)) elf32_rel;
+typedef struct {
+	unsigned int name, value, size;
+	unsigned char info, other;
+	unsigned short shndx;
+} __attribute__((packed)) elf32_sym;
+
+#define PT_LOAD     1
+#define PT_DYNAMIC  2
+#define DT_NULL     0
+#define DT_PLTRELSZ 2
+#define DT_STRTAB   5
+#define DT_SYMTAB   6
+#define DT_REL      17
+#define DT_RELSZ    18
+#define DT_PLTREL   20
+#define DT_JMPREL   23
+
+/* PROT_* flags of the mapping that contains addr, -1 when not found */
+static int region_prot(const char *maps, unsigned long addr)
+{
+	const char *p = maps;
+
+	while (p != NULL && *p != '\0') {
+		const char *nl = strchr(p, '\n');
+		unsigned long start, end;
+		const char *q = parse_hex_ul(p, &start);
+
+		if (*q == '-') {
+			q = parse_hex_ul(q + 1, &end);
+			while (*q == ' ')
+				q++;
+			if (addr >= start && addr < end) {
+				int prot = 0;
+
+				if (q[0] == 'r')
+					prot |= PROT_READ;
+				if (q[1] == 'w')
+					prot |= PROT_WRITE;
+				if (q[2] == 'x')
+					prot |= PROT_EXEC;
+				return prot;
+			}
+		}
+		p = nl ? nl + 1 : NULL;
+	}
+	return -1;
+}
+
+/* lowest mapping of the executable (its ELF header page), 0 when absent */
+static unsigned long exe_map_lowest(const char *maps, const char *exe)
+{
+	size_t exelen = strlen(exe);
+	unsigned long lowest = 0;
+	const char *p = maps;
+
+	while (p != NULL && *p != '\0') {
+		const char *nl = strchr(p, '\n');
+		const char *eol = nl ? nl : p + strlen(p);
+		unsigned long start, end;
+		const char *q = parse_hex_ul(p, &start);
+
+		if (*q == '-') {
+			q = parse_hex_ul(q + 1, &end);
+			while (*q == ' ' && q < eol)
+				q++;
+			if (exelen > 0) {
+				const char *path = NULL;
+				const char *s = q;
+
+				while (s < eol) {
+					if (*s == '/') {
+						path = s;
+						break;
+					}
+					s++;
+				}
+				if (path != NULL &&
+				    (size_t)(eol - path) >= exelen &&
+				    strncmp(path, exe, exelen) == 0 &&
+				    ((size_t)(eol - path) == exelen ||
+				     path[exelen] == ' ') &&
+				    (lowest == 0 || start < lowest))
+					lowest = start;
+			}
+		}
+		p = nl ? nl + 1 : NULL;
+	}
+	return lowest;
+}
+
+/* replace every reloc table entry for "memcmp" with the stub address */
+static int patch_rel_table(unsigned long addr, unsigned long size,
+			   unsigned long symtab, unsigned long strtab,
+			   unsigned long l_addr, const char *maps)
+{
+	elf32_rel *rel = (elf32_rel *)addr;
+	int count = (int)(size / sizeof(elf32_rel));
+	int i, hits = 0;
+
+	for (i = 0; i < count; i++) {
+		unsigned int symidx = rel[i].info >> 8;
+		elf32_sym *sym;
+		const char *name;
+		unsigned long slot, page;
+		int prot;
+
+		if (symidx == 0)
+			continue;
+		sym = (elf32_sym *)(symtab + symidx * sizeof(elf32_sym));
+		if (sym->name == 0)
+			continue;
+		name = (const char *)(strtab + sym->name);
+		if (strcmp(name, "memcmp") != 0)
+			continue;
+		slot = l_addr + rel[i].offset;
+		page = slot & ~0xfffUL;
+		prot = region_prot(maps, slot);
+		if (prot < 0)
+			continue;
+		if (mprotect((void *)page, 0x1000, PROT_READ | PROT_WRITE) != 0)
+			continue;
+		*(unsigned int *)(uintptr_t)slot =
+			(unsigned int)(uintptr_t)stub_memcmp;
+		mprotect((void *)page, 0x1000, prot);
+		hits++;
+	}
+	return hits;
+}
+
+/* Redirect the executable's memcmp GOT slot(s) to stub_memcmp().  Returns
+ * the number of slots patched, or -1 when the executable cannot be parsed. */
+static int patch_memcmp_got(const char *exe)
+{
+	static char maps[32768];
+	elf32_ehdr *eh;
+	elf32_phdr *ph;
+	elf32_dyn *dyn;
+	unsigned long base, first_load = 0, dyn_vaddr = 0, l_addr;
+	unsigned long strtab = 0, symtab = 0, jmprel = 0, pltrelsz = 0;
+	unsigned long rel = 0, relsz = 0;
+	unsigned int pltrel = DT_REL;
+	size_t off = 0;
+	ssize_t n;
+	int fd, i, have_load = 0, hits = 0;
+
+	fd = open("/proc/self/maps", O_RDONLY);
+	if (fd < 0)
+		return -1;
+	while (off < sizeof(maps) - 1 &&
+	       (n = read(fd, maps + off, sizeof(maps) - 1 - off)) > 0)
+		off += (size_t)n;
+	close(fd);
+	if (off == 0)
+		return -1;
+	maps[off] = '\0';
+
+	base = exe_map_lowest(maps, exe);
+	if (base == 0)
+		return -1;
+
+	eh = (elf32_ehdr *)(uintptr_t)base;
+	if (eh->ident[0] != 0x7f || eh->ident[1] != 'E' ||
+	    eh->ident[2] != 'L' || eh->ident[3] != 'F')
+		return -1;
+
+	ph = (elf32_phdr *)(uintptr_t)(base + eh->phoff);
+	for (i = 0; i < eh->phnum; i++) {
+		if (ph[i].type == PT_LOAD &&
+		    (!have_load || ph[i].vaddr < first_load)) {
+			first_load = ph[i].vaddr;
+			have_load = 1;
+		}
+		if (ph[i].type == PT_DYNAMIC)
+			dyn_vaddr = ph[i].vaddr;
+	}
+	if (!have_load || dyn_vaddr == 0)
+		return -1;
+	l_addr = base - (first_load & ~0xfffUL);
+
+	dyn = (elf32_dyn *)(uintptr_t)(l_addr + dyn_vaddr);
+	for (i = 0; dyn[i].tag != DT_NULL && i < 128; i++) {
+		switch (dyn[i].tag) {
+		case DT_STRTAB:
+			strtab = l_addr + dyn[i].val;
+			break;
+		case DT_SYMTAB:
+			symtab = l_addr + dyn[i].val;
+			break;
+		case DT_JMPREL:
+			jmprel = l_addr + dyn[i].val;
+			break;
+		case DT_PLTRELSZ:
+			pltrelsz = dyn[i].val;
+			break;
+		case DT_PLTREL:
+			pltrel = dyn[i].val;
+			break;
+		case DT_REL:
+			rel = l_addr + dyn[i].val;
+			break;
+		case DT_RELSZ:
+			relsz = dyn[i].val;
+			break;
+		}
+	}
+	if (symtab == 0 || strtab == 0)
+		return -1;
+
+	if (pltrel == DT_REL && jmprel != 0 && pltrelsz != 0)
+		hits += patch_rel_table(jmprel, pltrelsz, symtab, strtab,
+					l_addr, maps);
+	if (rel != 0 && relsz != 0)
+		hits += patch_rel_table(rel, relsz, symtab, strtab, l_addr,
+					maps);
+	return hits;
+}
+
 /* ---------------------------------------------------------------- keygen */
 
 /* Run the embedded keygen in this process: generate the software id if
@@ -281,6 +538,11 @@ static void preload_init(void)
 		int hits = patch_licence_key(exe);
 
 		console_log("[ldpreload] keyman: licence key patched (%d site%s)\n",
+			    hits, hits == 1 ? "" : "s");
+	} else if (strcmp(base, "loader") == 0) {
+		int hits = patch_memcmp_got(exe);
+
+		console_log("[ldpreload] loader: memcmp GOT patched (%d slot%s)\n",
 			    hits, hits == 1 ? "" : "s");
 	}
 }

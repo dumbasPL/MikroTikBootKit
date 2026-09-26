@@ -137,12 +137,16 @@ Build:
 ```sh
 ./build.sh                        # -> ptrace_init (static i386)
                                   #    bootkit.efi (EFI loader, see efiboot.c)
+                                  #    bootkit.img (32 MB USB stick image)
 ```
 
 Install: `./build.sh` packs the binary into a cpio and embeds that in the EFI
 loader (`bootkit.efi`), which boots it with `rdinit=/ptrace_init`.  The stock
 initramfs is not modified - `/init` stays the real init, which the wrapper
-execs unchanged.
+execs unchanged.  `bootkit.img` is an MBR disk with one FAT EFI system
+partition holding the loader as `\EFI\BOOT\BOOTX64.EFI`; flash it to a USB
+stick (`dd if=bootkit.img of=/dev/sdX bs=4M conv=fsync`) and boot the router
+from it to run the install menu.
 
 ## Test setup used here
 
@@ -226,7 +230,7 @@ moving to another RouterOS version.
 image is never touched):
 
 ```sh
-./vmtest.sh prepare              # build, copy the image, build the installer stick
+./vmtest.sh prepare              # build, copy the image, use bootkit.img as the stick
 ./vmtest.sh install              # boot stick + target and drive the installer
 ./vmtest.sh boot                 # start QEMU (background, serial on a socket)
 ./vmtest.sh boot-removable       # boot stick + target (stick first)

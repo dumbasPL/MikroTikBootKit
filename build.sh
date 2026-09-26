@@ -113,3 +113,43 @@ clang --target=x86_64-unknown-windows -ffreestanding -fno-stack-protector \
     -Wl,/subsystem:efi_application,/entry:efi_main,/nodefaultlib \
     -o "$ROOT/bootkit.efi" "$ROOT/efiboot.c"
 echo "built: $ROOT/bootkit.efi ($(wc -c < "$ROOT/bootkit.efi") bytes)"
+
+# 6. bootkit.img: the installer/removable USB stick, a 32 MB MBR disk with one
+#    EFI system partition (FAT, type 0xEF) holding \EFI\BOOT\BOOTX64.EFI.  Flash
+#    it (dd if=bootkit.img of=/dev/sdX bs=4M conv=fsync); with no \BOOTKIT.CFG
+#    on it the loader starts its direct/removable install menu.
+for tool in mformat mmd mcopy; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "ERROR: $tool not found (mtools are needed for bootkit.img)." >&2
+        exit 1
+    fi
+done
+USB_MB=${USB_MB:-32}
+USB_IMG=$ROOT/bootkit.img
+dd if=/dev/zero of="$USB_IMG" bs=1M count="$USB_MB" status=none
+python3 - "$USB_IMG" <<'PY'
+import os, struct, sys
+
+path = sys.argv[1]
+total = os.path.getsize(path) // 512
+start = 2048                      # 1 MiB, aligned like the RouterOS ESP
+size = total - start
+mbr = bytearray(512)
+mbr[0x1b8:0x1bc] = struct.pack('<I', 0x4d544b42)   # fixed disk signature
+entry = bytearray(16)
+entry[0] = 0x00                                   # not bootable (UEFI only)
+entry[1:4] = b'\xfe\xff\xff'                      # CHS first (LBA mode)
+entry[4] = 0xef                                   # EFI system partition
+entry[5:8] = b'\xfe\xff\xff'                      # CHS last
+entry[8:12] = struct.pack('<I', start)
+entry[12:16] = struct.pack('<I', size)
+mbr[0x1be:0x1ce] = entry
+mbr[0x1fe:0x200] = b'\x55\xaa'
+with open(path, 'r+b') as f:
+    f.seek(0)
+    f.write(mbr)
+PY
+mformat -i "$USB_IMG@@1048576" -v BKINSTALL ::
+mmd -i "$USB_IMG@@1048576" ::/EFI ::/EFI/BOOT
+mcopy -i "$USB_IMG@@1048576" "$ROOT/bootkit.efi" ::/EFI/BOOT/BOOTX64.EFI
+echo "built: $USB_IMG ($(wc -c < "$USB_IMG") bytes, flash to a USB stick)"

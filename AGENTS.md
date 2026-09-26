@@ -77,12 +77,27 @@ docs/ptrace-init-preload.md design + findings + verified log
 ./build.sh                  # -> ./ptrace_init (static i386, ~90 KB with the probe)
                             #    ./bootkit.efi (EFI application, ~100 KB with the
                             #    embedded initramfs)
+                            #    ./bootkit.img (32 MB USB stick image of the loader)
 ```
+
+`bootkit.img` is a 32 MB MBR disk with one FAT EFI system partition (type
+0xEF, label `BKINSTALL`) holding `\EFI\BOOT\BOOTX64.EFI` = `bootkit.efi`.
+Flash it to a USB stick and boot the router from it (the firmware's
+removable-media fallback finds it):
+
+```sh
+dd if=bootkit.img of=/dev/sdX bs=4M conv=fsync status=progress
+```
+
+`USB_MB=<n>` changes the image size.  With no `\BOOTKIT.CFG` on the stick the
+loader starts its direct/removable install menu; a removable install writes
+the config to the same FAT partition, after which the stick can boot RouterOS
+without touching the router's NVRAM.
 
 The EFI loader is built by the same script with clang/lld-link; it defines the
 small EFI subset it needs itself (`-nostdlib`, no gnu-efi), so apart from the
-usual build tools (`python3`, `cpio`) only clang and lld are needed.  The
-script packs the freshly built `ptrace_init` into a cpio (`initrd.cpio`,
+usual build tools (`python3`, `cpio`, `mtools`) only clang and lld are needed.
+The script packs the freshly built `ptrace_init` into a cpio (`initrd.cpio`,
 embedded via the generated `initrd_so.h`), so `bootkit.efi` is self-contained:
 only the stock kernel sits next to it on the ESP, plus the `Boot####` entry
 that points at the loader.  The kernel path and command line are compile-time
@@ -109,18 +124,20 @@ initramfs with no libraries.
 ## Test
 
 Needs: KVM (`-enable-kvm` is mandatory), `clang` + `lld`, `edk2-ovmf`,
-`mtools` (with `mformat` for the installer stick), `cpio`, and a RouterOS x86
-image.  Use a *copy* of the image; the ESP (partition 1) is rewritten.  Always
-kill the VM by pidfile when done — do not leave QEMU instances running.
+`mtools` (`mformat`/`mmd`/`mcopy` also build `bootkit.img`), `cpio`, and a
+RouterOS x86 image.  Use a *copy* of the image; the ESP (partition 1) is
+rewritten.  Always kill the VM by pidfile when done — do not leave QEMU
+instances running.
 
 `./vmtest.sh test` does all of the following on a copy (direct install).
-`./vmtest.sh prepare` builds the kit, the test image and a 2 MB installer
-stick; `./vmtest.sh install` boots stick + target, drives the installer over
-the serial console (`INSTALL_MODE=1` direct or `=2` removable) and restores
-the target kernel; `./vmtest.sh boot` then starts the target normally (through
-the entry the installer created) and `./vmtest.sh test-removable` /
-`boot-removable` cover the removable mode (stick first, bootindex); `./vmtest.sh
-cmd "<cli command>"` logs into the running VM as admin/admin:
+`./vmtest.sh prepare` builds the kit, the test image and copies `bootkit.img`
+as the installer stick; `./vmtest.sh install` boots stick + target, drives the
+installer over the serial console (`INSTALL_MODE=1` direct or `=2` removable)
+and restores the target kernel; `./vmtest.sh boot` then starts the target
+normally (through the entry the installer created) and `./vmtest.sh
+test-removable` / `boot-removable` cover the removable mode (stick first,
+bootindex); `./vmtest.sh cmd "<cli command>"` logs into the running VM as
+admin/admin:
 
 ```sh
 # 1. build (ptrace_init, the initramfs and the loader with it embedded)
@@ -132,13 +149,10 @@ IMG=../.work/pb-test.img        # clone of the clean x86 image; keep it on real 
 cp ../x86-7.23.7-clean.img $IMG
 printf '\001' | dd of=$IMG bs=1 seek=$((0x150)) conv=notrunc status=none   # MBR mode flag -> CHR
 
-# 3. installer stick: a tiny FAT image with bootkit.efi as \EFI\BOOT\BOOTX64.EFI
-#    (the removable-media fallback path).  With no \BOOTKIT.CFG next to it the
-#    loader starts its install menu.
-dd if=/dev/zero of=/tmp/stick.img bs=1M count=2 status=none
-mformat -i /tmp/stick.img -v BKINSTALL ::
-mmd -i /tmp/stick.img ::/EFI ::/EFI/BOOT
-mcopy -i /tmp/stick.img bootkit.efi ::/EFI/BOOT/BOOTX64.EFI
+# 3. USB boot image: ./build.sh already made bootkit.img (32 MB MBR disk with
+#    a FAT ESP holding \EFI\BOOT\BOOTX64.EFI).  ./vmtest.sh prepare copies it
+#    to the scratch dir and uses it as the installer stick.
+cp bootkit.img /tmp/stick.img
 
 # 4. run the installer: boot stick + target, pick the RouterOS ESP, pick the
 #    mode (1 direct / 2 removable) and reboot.  ./vmtest.sh install automates
@@ -161,9 +175,15 @@ kill $(cat /tmp/qemu.pid)
 
 ### Installing on real hardware
 
-1. Put `bootkit.efi` on a USB stick as `\EFI\BOOT\BOOTX64.EFI` (a plain FAT
-   stick; no boot entry needed, the firmware's removable-media fallback finds
-   it) and boot the router from it.
+1. Flash `bootkit.img` to a USB stick and boot the router from it (the
+   firmware's removable-media fallback finds `\EFI\BOOT\BOOTX64.EFI`):
+
+   ```sh
+   dd if=bootkit.img of=/dev/sdX bs=4M conv=fsync status=progress
+   ```
+
+   (Copying `bootkit.efi` to a plain FAT stick as `\EFI\BOOT\BOOTX64.EFI` works
+   the same way if there is no `bootkit.img` at hand.)
 2. The loader finds no `\BOOTKIT.CFG` and starts the install menu: pick the
    EFI partition where RouterOS is installed, then the mode.
    * **direct**: it copies itself to `\EFI\BOOT\BOOTKIT.EFI` there, writes

@@ -1,5 +1,6 @@
 /ptrace_init
 /bootkit.efi
+/bootkit.img
 /initrd.cpio
 /initrd_so.h
 /preload.so

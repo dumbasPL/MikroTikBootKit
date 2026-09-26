@@ -5,16 +5,17 @@
 # \EFI\BOOT\BOOTKIT.EFI and is reached through a Boot#### entry; the stock
 # kernel stays at \EFI\BOOT\BOOTX64.EFI so RouterOS updates can overwrite it.
 #
-# The boot entry is created by the loader's own installer: the test boots a
-# small "installer stick" (a FAT image with bootkit.efi as \EFI\BOOT\BOOTX64.EFI)
-# together with the target image, answers the installer's selection prompt over
-# the serial console, and then boots the target normally.
+# The installer is the bootkit.img the build produces (MBR disk with a FAT ESP
+# holding the loader as \EFI\BOOT\BOOTX64.EFI): the test boots it as a USB
+# stick together with the target image, answers the install menu over the
+# serial console, and then boots the target normally.
 #
 # The source image is never modified: everything happens on $WORK/test.img.
 #
 # Usage:
-#   ./vmtest.sh prepare [IMG]   build the bootkit, make the test image and the
-#                               installer stick, start from a fresh varstore
+#   ./vmtest.sh prepare [IMG]   build the bootkit (and bootkit.img), make the
+#                               test image, copy the boot image as the stick
+#                               and start from a fresh varstore
 #   ./vmtest.sh install         boot stick + target, run the installer
 #   ./vmtest.sh boot            start QEMU in the background (target only)
 #   ./vmtest.sh boot-removable  boot the stick + target (stick first)
@@ -116,13 +117,9 @@ cmd_prepare() {
         *)    die "MODE must be chr, x86 or keep" ;;
     esac
 
-    log "== building the installer stick ($STICK)"
+    log "== using the boot image ($ROOT/bootkit.img -> $STICK)"
     export MTOOLS_SKIP_CHECK=1
-    rm -f "$STICK"
-    dd if=/dev/zero of="$STICK" bs=1M count=2 status=none
-    mformat -i "$STICK" -v BKINSTALL ::
-    mmd -i "$STICK" ::/EFI ::/EFI/BOOT
-    mcopy -i "$STICK" "$ROOT/bootkit.efi" ::/EFI/BOOT/BOOTX64.EFI
+    cp -f "$ROOT/bootkit.img" "$STICK"
 
     log "== fresh varstore (the installer creates the boot entry)"
     rm -f "$WORK/vars.fd"

@@ -7,5 +7,4 @@
 /bootloader/initrd_so.h
 *.img
 *.iso
-/keys.env
 /.toolchain/

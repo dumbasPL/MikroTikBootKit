@@ -79,8 +79,6 @@ bootloader/                 the EFI-side loader (-> \EFI\BOOT\BOOTKIT.EFI)
   installer.c               install menu (direct / removable)
 tools/musl_i386.sh          builds the local i486-musl toolchain (downloads
                             and compiles musl; picked up by build.sh)
-keys.env.example            licence key material template (keys.env is
-                            gitignored)
 build.sh                    builds the bootkit, the bootloader and bootkit.img
 vmtest.sh                   prepare/install/boot/interact with a test image copy
 vmconsole.py                serial-console helper used by vmtest.sh cmd and the
@@ -135,12 +133,10 @@ dynamic linker against the libc already in the process (RouterOS /lib/libc.so).
 The licence tooling is built in: `keygen.c` is the standalone RouterOS keygen
 trimmed to the generation role (no CLI, no mode2 hand-over, no `exit()`,
 clean `kg_generate()`/`kg_error()` API) and is `#include`d by `preload.c`.
-The key material is baked in at build time from `$ROOT/keys.env` when that
-file exists (gitignored; `keys.env.example` lists the variables):
-`CUSTOM_LICENSE_PUBLIC_KEY` / `CUSTOM_LICENSE_PRIVATE_KEY`, stock key
-`MIKRO_LICENSE_PUBLIC_KEY`; all are overridable via environment / `KEYS_ENV`,
-and without the file the defaults baked into `keygen.c` / `preload.c` are
-used.
+The key material is hard-coded in `keygen.c` / `preload.c`; the environment
+variables `CUSTOM_LICENSE_PUBLIC_KEY` / `CUSTOM_LICENSE_PRIVATE_KEY` (the
+pair) and `MIKRO_LICENSE_PUBLIC_KEY` (the stock key) override it at build
+time.
 
 The i386 binary is always built against musl: `build.sh` uses the local
 `.toolchain/i386-musl`, and if that is missing it runs `tools/musl_i386.sh`

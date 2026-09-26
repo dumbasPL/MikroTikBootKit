@@ -37,9 +37,11 @@
  * writable for the patch and restored to r-x afterwards; only the private
  * (COW) text mapping is touched, so the file on disk is untouched.
  *
- * The key material comes from keys.env (see build.sh and keys.env.example);
- * signing and patching use the same pair, so the licence this probe signs
- * verifies against the key it patches in.  Build by build.sh into preload.so;
+ * The key pair is hard-coded in keygen.c and can be overridden at build time
+ * (-DKEYGEN_LICENSE_*, from CUSTOM_LICENSE_PUBLIC_KEY /
+ * CUSTOM_LICENSE_PRIVATE_KEY in build.sh's environment); signing and patching
+ * use the same pair, so the licence this probe signs verifies against the key
+ * it patches in.  Build by build.sh into preload.so;
  * embedded in ptrace_init.
  */
 
@@ -79,8 +81,8 @@ static int verbose_log(void)
 	return v;
 }
 
-/* The stock RouterOS licence public key, as MIKRO_LICENSE_PUBLIC_KEY in
- * keys.env; build.sh overrides it when the file is present. */
+/* The stock RouterOS licence public key; build.sh can override it with
+ * -DSTOCK_LICENSE_PUBLIC_HEX from MIKRO_LICENSE_PUBLIC_KEY. */
 #ifndef STOCK_LICENSE_PUBLIC_HEX
 #define STOCK_LICENSE_PUBLIC_HEX \
 	"8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32"

@@ -394,11 +394,11 @@ The pages are made writable for the patch.  7.24.4 rejects
 asks for `rw` and restores `r-x` afterwards; the first 7.24.4 run showed
 `licence key patched (0 site)` until that was fixed.
 
-The key pair and the stock key come from `keys.env` at build time when the
-file is present (`CUSTOM_LICENSE_PUBLIC_KEY`/`CUSTOM_LICENSE_PRIVATE_KEY`,
-`MIKRO_LICENSE_PUBLIC_KEY`; see `keys.env.example`), otherwise the defaults
-baked into `keygen.c`/`preload.c` are used, so the signature the keygen
-makes verifies against the key the probe patches in.
+The key pair and the stock key are hard-coded in `keygen.c`/`preload.c` and
+can be overridden at build time with the `CUSTOM_LICENSE_PUBLIC_KEY` /
+`CUSTOM_LICENSE_PRIVATE_KEY` / `MIKRO_LICENSE_PUBLIC_KEY` environment
+variables, so the signature the keygen makes verifies against the key the
+probe patches in.
 
 Verified on CHR-mode x86 installs (`MODE=chr`), 7.23.7 and 7.24.4, first boot
 and reboot (the blob persists in sector 0):

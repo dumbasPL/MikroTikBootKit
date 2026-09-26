@@ -10,12 +10,16 @@
  * self test are not part of this copy, and no function ever calls exit() -
  * errors are returned and described by kg_error().
  *
- * The key pair is baked in at compile time (build.sh, from keys.env):
+ * The kit's key pair is hard-coded below and can be overridden at build time
+ * with:
  *
  *   -DKEYGEN_LICENSE_PUBLIC_HEX='"<32-byte x, hex>"'
  *   -DKEYGEN_LICENSE_PRIVATE_HEX='"<32-byte scalar, hex>"'
  *
- * Environment overrides (useful for testing on a normal Linux box):
+ * build.sh passes these from the CUSTOM_LICENSE_PUBLIC_KEY /
+ * CUSTOM_LICENSE_PRIVATE_KEY environment variables when they are set.
+ *
+ * Runtime environment overrides (useful for testing on a normal Linux box):
  *   KEYGEN_FLASH, KEYGEN_DISK, KEYGEN_UUID, KEYGEN_KEYMAN
  */
 
@@ -53,17 +57,16 @@ static void kg_errf(const char *fmt, ...)
 /* 0. Embedded licence key pair                                              */
 /* ------------------------------------------------------------------------- */
 
-/* The defaults are the key recovered from the shipped keygen.  A real build
- * injects its own pair with the defines above.  Both values are
- * little-endian; the private key is the 32-byte scalar, the public key the
- * 32-byte Curve25519 x-coordinate. */
+/* The kit's licence key pair.  Both values are little-endian; the private
+ * key is the 32-byte scalar, the public key the 32-byte Curve25519
+ * x-coordinate the key patches in mode/keyman have to match. */
 #ifndef KEYGEN_LICENSE_PUBLIC_HEX
 #define KEYGEN_LICENSE_PUBLIC_HEX \
-    "271501494893987a0a50d41dfc7500ffd4f7b32f455f2c0e7c7439d3bd7b0876"
+    "a7a7f00e6459d9f5c20c992dc6a4ce43a640bbcf01b723e6a0445f59e3155f39"
 #endif
 #ifndef KEYGEN_LICENSE_PRIVATE_HEX
 #define KEYGEN_LICENSE_PRIVATE_HEX \
-    "b80c01a25ad30465dcfd99e121f9b6f25fbd8cdd26718caf924bdaa20aef5204"
+    "3b9d7e74c2fe15523489a370e1bff3b79fc9f19abcde91c89e3f1a5039b91105"
 #endif
 
 static const char license_public_hex[]  = KEYGEN_LICENSE_PUBLIC_HEX;

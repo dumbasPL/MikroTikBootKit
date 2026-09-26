@@ -34,18 +34,10 @@ fi
 #    time by the dynamic linker against the process's libc.
 #
 #    The probe carries the embedded keygen (keygen.c, included by preload.c)
-#    and patches the licence public key in mode/keyman, to the key pair in
-#    $ROOT/keys.env when present (gitignored; see keys.env.example).  The
-#    key pair can be overridden with
-#    CUSTOM_LICENSE_PUBLIC_KEY / CUSTOM_LICENSE_PRIVATE_KEY, the stock key
-#    with MIKRO_LICENSE_PUBLIC_KEY; when nothing is set the defaults baked
-#    into keygen.c / preload.c are used.
-KEYS_ENV=${KEYS_ENV:-$ROOT/keys.env}
-if [ -f "$KEYS_ENV" ]; then
-    [ -n "${CUSTOM_LICENSE_PUBLIC_KEY:-}" ] || CUSTOM_LICENSE_PUBLIC_KEY=$(sed -n 's/^CUSTOM_LICENSE_PUBLIC_KEY=//p' "$KEYS_ENV" | head -n1)
-    [ -n "${CUSTOM_LICENSE_PRIVATE_KEY:-}" ] || CUSTOM_LICENSE_PRIVATE_KEY=$(sed -n 's/^CUSTOM_LICENSE_PRIVATE_KEY=//p' "$KEYS_ENV" | head -n1)
-    [ -n "${MIKRO_LICENSE_PUBLIC_KEY:-}" ] || MIKRO_LICENSE_PUBLIC_KEY=$(sed -n 's/^MIKRO_LICENSE_PUBLIC_KEY=//p' "$KEYS_ENV" | head -n1)
-fi
+#    and patches the licence public key in mode/keyman.  The key pair is
+#    hard-coded in keygen.c / preload.c; the environment can override it:
+#    CUSTOM_LICENSE_PUBLIC_KEY / CUSTOM_LICENSE_PRIVATE_KEY (the pair) and
+#    MIKRO_LICENSE_PUBLIC_KEY (the stock key).
 
 DEFS="-DBOOTKIT_DEBUG_DEFAULT=$DEBUG"
 [ -n "${CUSTOM_LICENSE_PUBLIC_KEY:-}" ] && DEFS="$DEFS -DKEYGEN_LICENSE_PUBLIC_HEX=\"$CUSTOM_LICENSE_PUBLIC_KEY\""
@@ -53,7 +45,7 @@ DEFS="-DBOOTKIT_DEBUG_DEFAULT=$DEBUG"
 [ -n "${MIKRO_LICENSE_PUBLIC_KEY:-}" ] && DEFS="$DEFS -DSTOCK_LICENSE_PUBLIC_HEX=\"$MIKRO_LICENSE_PUBLIC_KEY\""
 echo "== build: DEBUG=$DEBUG (1 = serial console + verbose tracer/probe logs)"
 echo "== i386 compiler: $CC"
-echo "== probe keys: custom ${CUSTOM_LICENSE_PUBLIC_KEY:-<keygen.c default>}, stock ${MIKRO_LICENSE_PUBLIC_KEY:-<built-in default>}"
+echo "== probe keys: custom ${CUSTOM_LICENSE_PUBLIC_KEY:-<built-in>}, stock ${MIKRO_LICENSE_PUBLIC_KEY:-<built-in>}"
 
 # shellcheck disable=SC2086
 $CC -shared -fPIC -nostdlib -Os -fno-stack-protector -fvisibility=hidden \

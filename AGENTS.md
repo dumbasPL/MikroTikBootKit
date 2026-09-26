@@ -136,10 +136,14 @@ when the stored one no longer verifies).
   cross-checks its embedded key against other state at boot and a modified
   loader aborts the system supervisor (`/nova/bin/sys2`); the CHR boot gate
   does not need its key patched.  The probe only patches `mode` and `keyman`.
-* **The licence check is CHR-tested only.**  On CHR the licence is bound to
-  the VM UUID plus the software id; x86 mode has extra hardware checks and is
-  not attempted yet (the embedded keygen still contains the x86 path, it is
-  just unverified).
+* **The licence is tested on CHR and x86.**  CHR binds to the VM UUID plus
+  the software id; x86 mode (7.23.7 and 7.24.4) binds to the
+  hardware-derived software id and works as well: mode reports
+  `nlevel: 6` / `features: extra-channels` and the boot gate passes even
+  with the demo counter maxed.  Caveats: the CLI shows a rolling ~72 h
+  `expires-in`, and the loader/initramfs gate only checks the payload
+  binding (a corrupted signature still boots; mode re-signs it).  Details:
+  `docs/ptrace-init-preload.md`.
 * **Do not boot with QEMU's `-kernel` + `-initrd`.**  It was tried: the
   wrapper runs, but the stock init then fails (`opendir: No such file or
   directory` → `ERROR: no system package found!`) and the kernel panics.  The

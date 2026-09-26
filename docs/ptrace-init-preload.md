@@ -356,10 +356,24 @@ Notes on scope:
   against other state; changing it aborts the supervisor (`/nova/bin/sys2`),
   and in CHR mode the loader gate does not require a valid signature anyway
   (the runtime `mode` daemon is the one that raises the level).
-* **x86 (non-CHR) mode is not attempted yet** - it binds the licence to the
-  hardware id and has extra checks.  The embedded keygen still contains the
-  x86 path; it is just untested.  On CHR the licence is bound to the VM UUID
-  and the software id only.
+* **x86 (non-CHR) mode works too** - tested on the 7.23.7 and 7.24.4 x86
+  installs.  The keygen writes a freshly generated software id out first
+  (keyman re-reads the blob for `--software-id`), takes the serial from
+  keyman, signs the x86 licence value and mode reports `nlevel: 6` /
+  `features: extra-channels`; the software id is stable across reboots
+  ("licence already installed").  Two caveats, both untested past their
+  boundary:
+  - the CLI shows a rolling `expires-in` of ~72 h that resets each boot.  It
+    is not known whether a >72 h uptime is hard-limited (could not be waited
+    out); it may be an artifact of the zeroed expiry bytes in the generated
+    x86 licence value.
+  - the loader/initramfs boot gate does not verify the EC signature.  With
+    our licence's payload present it boots even when the demo counter is
+    maxed (`0xFFFF` at `0x10C`, which powers off a stock image with an empty
+    or garbage licence), and it boots with the signature bytes corrupted
+    (mode then re-signs: `licence generated`).  So in x86 mode the gate
+    passes on the payload's hardware binding, while the real signature check
+    is mode's (patched) verifier, as in CHR.
 
 ## Notes
 

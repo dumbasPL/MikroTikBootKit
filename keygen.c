@@ -1147,7 +1147,11 @@ int kg_generate(char *system_id, size_t system_id_size, int *changed)
     if (!swid_valid(cfg + OFF_SWID)) {
         if (!generate_swid(cfg + OFF_SWID))
             goto out;
-        dirty = 1;
+        /* write it out before anything reads the blob again: the x86 path
+         * asks keyman (a separate process) for the software id, and keyman
+         * reads the blob from disk */
+        if (write_config(cfg, cfg_len) != 0)
+            goto out;
     }
 
     if (cfg[OFF_MODE] == 1) {

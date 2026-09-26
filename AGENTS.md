@@ -1,6 +1,18 @@
 # MikroTikBootKit
 
-Boot-time tooling for MikroTik RouterOS images.  Currently one tool:
+Boot-time tooling for MikroTik RouterOS images.  Two pieces:
+
+* **`efiboot.c`** — a small self-contained EFI bootloader, installed as
+  `\EFI\BOOT\BOOTKIT.EFI` and reached through a `Boot####` entry.  It replaces
+  the EFI shell + `startup.nsh` trick the kit used before: it reads the stock
+  kernel from `\EFI\BOOT\BOOTX64.EFI` (left in place there, so a RouterOS
+  update overwrites it with the new kernel and the loader picks that up) and
+  carries the initramfs (a cpio with `ptrace_init`, built and embedded by
+  `build.sh`) inside the loader image, then enters the kernel through the x86
+  EFI handover protocol with a `struct boot_params` it fills in.  The entry
+  point is the kernel's own EFI stub, so the EFI runtime environment the init
+  expects is preserved.  Built with clang (`--target=x86_64-unknown-windows`,
+  PE32+, subsystem 10), freestanding, no gnu-efi and no libc.
 
 * **`ptrace_init.c`** — an alternative initramfs init (`rdinit=/ptrace_init`)
   that ptrace-attaches to the real init and waits for it to mount the tmpfs on
@@ -21,11 +33,15 @@ Design notes, the target behaviours it relies on and the observed boot log:
 ## Layout
 
 ```
+efiboot.c                   EFI loader (-> \EFI\BOOT\BOOTKIT.EFI): reads the
+                            stock kernel from \EFI\BOOT\BOOTX64.EFI, copies the
+                            embedded initramfs, fills boot_params and
+                            EFI-handover boots the kernel
 ptrace_init.c               the tool (static i386)
 preload.c                   LD_PRELOAD probe: console log, in-memory key patch,
                             embedded keygen glue
 keygen.c                    embeddable licence keygen (adapted from MikroTikPatch)
-build.sh                    builds + embeds the probe, then the tool
+build.sh                    builds + embeds the probe, then the tool and the loader
 vmtest.sh                   prepare/boot/interact with a test image copy
 vmconsole.py                serial-console helper used by vmtest.sh cmd
 docs/ptrace-init-preload.md design + findings + verified log
@@ -35,7 +51,18 @@ docs/ptrace-init-preload.md design + findings + verified log
 
 ```sh
 ./build.sh                  # -> ./ptrace_init (static i386, ~90 KB with the probe)
+                            #    ./bootkit.efi (EFI application, ~90 KB with the
+                            #    embedded initramfs)
 ```
+
+The EFI loader is built by the same script with clang/lld-link; it defines the
+small EFI subset it needs itself (`-nostdlib`, no gnu-efi), so apart from the
+usual build tools (`python3`, `cpio`) only clang and lld are needed.  The
+script packs the freshly built `ptrace_init` into a cpio (`initrd.cpio`,
+embedded via the generated `initrd_so.h`), so `bootkit.efi` is self-contained:
+only the stock kernel sits next to it on the ESP, plus the `Boot####` entry
+that points at the loader.  The kernel path and command line are compile-time
+constants at the top of `efiboot.c`.
 
 The LD_PRELOAD probe (preload.c) is ordinary C linked without libc
 (-nostdlib): no DT_NEEDED entry, the imports are bound at load time by the
@@ -57,33 +84,37 @@ initramfs with no libraries.
 
 ## Test
 
-Needs: KVM (`-enable-kvm` is mandatory), `edk2-ovmf` + `edk2-shell` (or any
-EFI shell binary), `mtools`, `cpio`, and a RouterOS x86 image.  Use a *copy*
-of the image; the ESP (partition 1) is rewritten.  Always kill the VM by
-pidfile when done — do not leave QEMU instances running.
+Needs: KVM (`-enable-kvm` is mandatory), `clang` + `lld`, `edk2-ovmf`,
+`edk2-shell` (only to install the boot entry once), `mtools`, `cpio`, and a
+RouterOS x86 image.  Use a *copy* of the image; the ESP (partition 1) is
+rewritten.  Always kill the VM by pidfile when done — do not leave QEMU
+instances running.
 
-`./vmtest.sh test` does all of the following on a copy (and
-`./vmtest.sh cmd "<cli command>"` logs into the running VM as admin/admin):
+`./vmtest.sh test` does all of the following on a copy; `./vmtest.sh prepare`
+also installs the EFI boot entry (`./vmtest.sh entry` redoes just that step
+into `$WORK/vars.fd`), and `./vmtest.sh cmd "<cli command>"` logs into the
+running VM as admin/admin:
 
 ```sh
-# 1. build + initrd
+# 1. build (ptrace_init, the initramfs and the loader with it embedded)
 ./build.sh
-rm -rf /tmp/pb-root && mkdir -p /tmp/pb-root
-cp ptrace_init /tmp/pb-root/
-(cd /tmp/pb-root && find . | cpio -o -H newc --owner=0:0) > /tmp/ptrace-init.cpio
 
-# 2. test image: copy, make it CHR mode (no licence needed), add the ESP files
+# 2. test image: copy, make it CHR mode (no licence needed), put the loader on
+#    the ESP; the stock \EFI\BOOT\BOOTX64.EFI kernel is left untouched
 IMG=../.work/pb-test.img        # clone of the clean x86 image; keep it on real disk, not tmpfs
 cp ../x86-7.23.7-clean.img $IMG
 printf '\001' | dd of=$IMG bs=1 seek=$((0x150)) conv=notrunc status=none   # MBR mode flag -> CHR
-mcopy -i $IMG@@1048576 ::/EFI/BOOT/BOOTX64.EFI /tmp/kernel.efi             # stock kernel, from the image itself
-mcopy -i $IMG@@1048576 -o /usr/share/edk2-shell/x64/Shell.efi ::/EFI/BOOT/BOOTX64.EFI
-mcopy -i $IMG@@1048576 -o /tmp/kernel.efi                     ::/EFI/BOOT/KERNEL.EFI
-mcopy -i $IMG@@1048576 -o /tmp/ptrace-init.cpio               ::/initrd.cpio
-printf 'fs0:\\EFI\\BOOT\\kernel.efi console=ttyS0,115200n8 initrd=\\initrd.cpio rdinit=/ptrace_init\n' > /tmp/startup.nsh
-mcopy -i $IMG@@1048576 -o /tmp/startup.nsh ::/startup.nsh
+mcopy -i $IMG@@1048576 -o bootkit.efi ::/EFI/BOOT/BOOTKIT.EFI
 
-# 3. boot (EFI shell runs startup.nsh; initrd comes in via the EFI stub)
+# 3. install the boot entry once.  The EFI shell is used as the installer (the
+#    same thing as bcfg/efibootmgr/the firmware menu on real hardware):
+#    BOOTX64.EFI is temporarily swapped for Shell.efi and a startup.nsh runs
+#      bcfg boot add 0 fs0:\EFI\BOOT\BOOTKIT.EFI "MikroTikBootKit"
+#    `./vmtest.sh entry` automates this and leaves the entry in $WORK/vars.fd
+#    (prepare calls it, then restores the stock BOOTX64.EFI).
+
+# 4. boot: the Boot#### entry starts \EFI\BOOT\BOOTKIT.EFI, which reads
+#    \EFI\BOOT\BOOTX64.EFI and copies the initramfs embedded in itself
 cp /usr/share/edk2/x64/OVMF_VARS.4m.fd /tmp/vars.fd
 qemu-system-x86_64 -m 1024 -smp 2 -cpu host -enable-kvm \
   -drive if=none,id=d1,file=$IMG,format=raw \
@@ -93,11 +124,40 @@ qemu-system-x86_64 -m 1024 -smp 2 -cpu host -enable-kvm \
   -drive if=pflash,format=raw,file=/tmp/vars.fd \
   -display none -serial file:/tmp/serial.log -pidfile /tmp/qemu.pid
 
-# 4. wait ~45 s, then check
+# 5. wait ~45 s, then check
+grep -a BdsDxe /tmp/serial.log           # Boot000N "MikroTikBootKit" -> BOOTKIT.EFI
+grep -a efiboot /tmp/serial.log          # loader messages
 grep -a ptrace-init /tmp/serial.log      # tracer messages
 grep -a ldpreload /tmp/serial.log        # every binary that loaded the probe
 tail -c 100 /tmp/serial.log              # should end with "CHR Login:"
 kill $(cat /tmp/qemu.pid)
+```
+
+### Installing on real hardware
+
+Copy `bootkit.efi` to the ESP as `\EFI\BOOT\BOOTKIT.EFI`, leave the stock
+kernel at `\EFI\BOOT\BOOTX64.EFI` where it is (RouterOS updates overwrite that
+file with the new kernel, which is exactly what the loader reads), then create
+the boot entry once:
+
+* from the UEFI shell: `bcfg boot add 0 fs0:\EFI\BOOT\BOOTKIT.EFI "MikroTikBootKit"`
+* from Linux running on the router (or a live system booted from its disk):
+  `efibootmgr -c -d /dev/sdX -p 1 -L MikroTikBootKit -l '\EFI\BOOT\BOOTKIT.EFI'`
+* or pick the file in the firmware's boot menu and move it to the top.
+
+After that, updates can replace `\EFI\BOOT\BOOTX64.EFI` freely: the loader and
+its boot entry stay in place and boot the updated kernel with the kit's
+initramfs.  If an update also rewrites `BootOrder` (some installers re-add
+their own entry), just move `MikroTikBootKit` back to the top once.
+
+Expected loader output (before the kernel takes over):
+
+```
+BdsDxe: loading Boot000N "MikroTikBootKit" ... FilePath(\EFI\BOOT\BOOTKIT.EFI)
+BdsDxe: starting Boot000N "MikroTikBootKit" ...
+efiboot: MikroTik boot kit loader
+efiboot: kernel 5.6.3-64 (gitlab-runner@cicd-a13.mt.lv) #1 SMP ...
+efiboot: initrd 86016 bytes, booting
 ```
 
 Expected tracer output:
@@ -151,10 +211,17 @@ when the stored one no longer verifies).
   directory` → `ERROR: no system package found!`) and the kernel panics.  The
   disk is fine (`/dev/vda{,1,2}` present, `/dev/vda2` mounts), and the same
   image boots under OVMF — the init appears to need the EFI environment.  Use
-  the EFI-shell route above.
-* The ESP files must be *added* to the image's own ESP; the stock kernel is
-  copied out of it first (`::/EFI/BOOT/BOOTX64.EFI`, 4,024,544 bytes) and put
-  back as `KERNEL.EFI` because the shell's name has to be `BOOTX64.EFI`.
+  the EFI loader above: its handover entry *is* the kernel's EFI stub, so the
+  init still gets the EFI runtime environment.
+* The loader is *added* to the image's own ESP as `\EFI\BOOT\BOOTKIT.EFI`;
+  the stock kernel stays at `\EFI\BOOT\BOOTX64.EFI` (4,036,832/4,024,544
+  bytes depending on the version) and is what `efiboot.c` reads (compile-time
+  constant at the top of the file).  The initramfs is part of `bootkit.efi`;
+  the firmware only needs the `Boot####` entry pointing at the loader.
+* A RouterOS update that replaces `\EFI\BOOT\BOOTX64.EFI` is harmless: the
+  loader and its boot entry stay, and the next boot loads the new kernel with
+  the kit's initramfs.  (Verified by swapping a 7.23.7 kernel into a 7.24.4
+  test image: the loader logged the new build date with no reinstall.)
 * `serial=test` on the USB storage is how the earlier live tests booted this
   image; it also feeds the x86 software-id (irrelevant in CHR mode).
 * For an interactive check, use a serial *socket* instead of `file:` and log

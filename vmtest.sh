@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # vmtest.sh - prepare, boot and interact with a RouterOS x86 image copy under
-# QEMU/KVM, with the ptrace_init bootkit installed in an external initrd.
+# QEMU/KVM, with the ptrace_init bootkit installed via its own EFI loader
+# (bootkit.efi, initramfs embedded).  The loader is installed as
+# \EFI\BOOT\BOOTKIT.EFI and is reached through a Boot#### entry; the stock
+# kernel stays at \EFI\BOOT\BOOTX64.EFI so RouterOS updates can overwrite it.
 #
 # The source image is never modified: everything happens on $WORK/test.img.
 #
 # Usage:
-#   ./vmtest.sh prepare [IMG]   build the bootkit, make the test image and put
-#                               the EFI shell + KERNEL.EFI + initrd.cpio +
-#                               startup.nsh on its ESP
+#   ./vmtest.sh prepare [IMG]   build the bootkit, make the test image, put
+#                               bootkit.efi on its ESP and install the EFI boot
+#                               entry for it
+#   ./vmtest.sh entry           (re)install the EFI boot entry into vars.fd
 #   ./vmtest.sh boot            start QEMU in the background
 #   ./vmtest.sh wait [SECS]     wait for the login prompt in the serial log
 #   ./vmtest.sh check           show the bootkit result lines
@@ -21,6 +25,7 @@
 #   IMG=<path>                  source image (default: x86-7.24.4-clean.img)
 #   MODE=chr|x86|keep           override the MBR mode flag (default: keep)
 #   MEM=1024  SMP=2             QEMU memory / cpus
+#   SHELL_EFI=<path>            EFI shell used only to install the boot entry
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
@@ -31,6 +36,7 @@ ESP_OFF=1048576                      # partition 1 starts at LBA 2048
 MODE=${MODE:-keep}
 MEM=${MEM:-1024}
 SMP=${SMP:-2}
+SHELL_EFI=${SHELL_EFI:-/usr/share/edk2-shell/x64/Shell.efi}
 
 SERIAL_SOCK=$WORK/serial.sock
 SERIAL_LOG=$WORK/serial.log
@@ -70,27 +76,70 @@ cmd_prepare() {
         *)    die "MODE must be chr, x86 or keep" ;;
     esac
 
-    log "== building initrd.cpio"
-    rm -f "$WORK/initrd.cpio"
-    (cd "$ROOT" && find ptrace_init -maxdepth 0 | cpio -o -H newc --owner=0:0 2>/dev/null) > "$WORK/initrd.cpio"
-
-    log "== installing the boot files on the ESP"
+    log "== installing the bootkit on the ESP (stock BOOTX64.EFI stays in place)"
     export MTOOLS_SKIP_CHECK=1
     local esp="$IMG@@$ESP_OFF"
-    mcopy -o -i "$esp" ::/EFI/BOOT/BOOTX64.EFI "$WORK/kernel.efi"
-    mcopy -o -i "$esp" /usr/share/edk2-shell/x64/Shell.efi ::/EFI/BOOT/BOOTX64.EFI
-    mcopy -o -i "$esp" "$WORK/kernel.efi" ::/EFI/BOOT/KERNEL.EFI
-    mcopy -o -i "$esp" "$WORK/initrd.cpio" ::/initrd.cpio
-    printf 'fs0:\\EFI\\BOOT\\kernel.efi console=ttyS0,115200n8 initrd=\\initrd.cpio rdinit=/ptrace_init\n' > "$WORK/startup.nsh"
-    mcopy -o -i "$esp" "$WORK/startup.nsh" ::/startup.nsh
+    mcopy -o -i "$esp" "$ROOT/bootkit.efi" ::/EFI/BOOT/BOOTKIT.EFI
     mdir -i "$esp" ::/ ::/EFI/BOOT | sed -n '1,3p;$p' >/dev/null
+
+    cmd_install_entry
     log "== ready: $IMG"
+}
+
+# Install a Boot#### entry pointing at \EFI\BOOT\BOOTKIT.EFI into
+# $WORK/vars.fd.  This is the one-time step the loader needs; on real hardware
+# it is done with efibootmgr, bcfg or the firmware boot menu.  Here the EFI
+# shell does it: BOOTX64.EFI is temporarily swapped for the shell (which runs
+# startup.nsh with the bcfg command), and the stock kernel is restored after.
+cmd_install_entry() {
+    [ -f "$IMG" ] || die "no test image, run: $0 prepare"
+    [ -f "$SHELL_EFI" ] || die "EFI shell not found: $SHELL_EFI (set SHELL_EFI)"
+    local esp="$IMG@@$ESP_OFF" t0
+
+    mkdir -p "$WORK"
+    log "== installing the EFI boot entry (bcfg in the EFI shell)"
+    export MTOOLS_SKIP_CHECK=1
+    mcopy -o -i "$esp" ::/EFI/BOOT/BOOTX64.EFI "$WORK/stock-bootx64.efi"
+    mcopy -o -i "$esp" "$SHELL_EFI" ::/EFI/BOOT/BOOTX64.EFI
+    printf 'bcfg boot add 0 fs0:\\EFI\\BOOT\\BOOTKIT.EFI "MikroTikBootKit"\r\n' > "$WORK/startup.nsh"
+    mcopy -o -i "$esp" "$WORK/startup.nsh" ::/startup.nsh
+
+    stop_qemu
+    rm -f "$WORK/vars.fd"
+    cp -f /usr/share/edk2/x64/OVMF_VARS.4m.fd "$WORK/vars.fd"
+    : > "$SERIAL_LOG"
+    rm -f "$SERIAL_SOCK"
+    # shellcheck disable=SC2046
+    $(qemu_cmd) -daemonize -pidfile "$PIDFILE"
+    t0=$(date +%s)
+    while [ $(( $(date +%s) - t0 )) -lt 40 ]; do
+        grep -aq 'Shell>' "$SERIAL_LOG" 2>/dev/null && break
+        sleep 0.5
+    done
+    sleep 2                          # let bcfg flush the variable to pflash
+    stop_qemu
+
+    mcopy -o -i "$esp" "$WORK/stock-bootx64.efi" ::/EFI/BOOT/BOOTX64.EFI
+    mdel -i "$esp" ::/startup.nsh 2>/dev/null || true
+
+    if ! python3 - "$WORK/vars.fd" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+sys.exit(0 if 'BOOTKIT.EFI'.encode('utf-16-le') in data else 1)
+PY
+    then
+        die "boot entry installation failed (BOOTKIT.EFI not in vars.fd)"
+    fi
+    log "== boot entry installed: Boot#### -> \\EFI\\BOOT\\BOOTKIT.EFI"
 }
 
 cmd_boot() {
     [ -f "$IMG" ] || die "no test image, run: $0 prepare"
     stop_qemu
-    cp -f /usr/share/edk2/x64/OVMF_VARS.4m.fd "$WORK/vars.fd"
+    if [ ! -f "$WORK/vars.fd" ]; then
+        cp -f /usr/share/edk2/x64/OVMF_VARS.4m.fd "$WORK/vars.fd"
+        log "== fresh varstore (no boot entry; run: $0 entry)"
+    fi
     : > "$SERIAL_LOG"
     rm -f "$SERIAL_SOCK"
     # shellcheck disable=SC2046
@@ -126,6 +175,8 @@ cmd_wait() {
 }
 
 cmd_check() {
+    echo "--- loader:"
+    grep -aE 'BdsDxe: (loading|starting) Boot.*MikroTikBootKit|efiboot:' "$SERIAL_LOG" || echo "(no loader lines!)"
     echo "--- tracer:"
     grep -a 'ptrace-init' "$SERIAL_LOG" || echo "(no ptrace-init lines!)"
     echo "--- preload loads:"
@@ -156,6 +207,7 @@ cmd_test() {
 
 case "${1:-}" in
     prepare) shift; cmd_prepare "$@" ;;
+    entry)   cmd_install_entry ;;
     boot)    cmd_boot ;;
     wait)    shift; cmd_wait "$@" ;;
     check)   cmd_check ;;
@@ -163,5 +215,5 @@ case "${1:-}" in
     cmd)     shift; cmd_cmd "$@" ;;
     stop)    cmd_stop ;;
     test)    cmd_test ;;
-    *)       sed -n '2,30p' "$0"; exit 1 ;;
+    *)       sed -n '2,34p' "$0"; exit 1 ;;
 esac

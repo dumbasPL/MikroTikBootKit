@@ -76,3 +76,40 @@ PY
 # shellcheck disable=SC2086
 $CC -static -Os -Wall -o "$OUT" "$ROOT/ptrace_init.c"
 echo "built: $OUT ($(wc -c < "$OUT") bytes), preload.so ($(wc -c < "$ROOT/preload.so") bytes)"
+
+# 4. the initramfs (the just-built ptrace_init alone, cpio/newc) and its
+#    embedded C array for the EFI loader.
+if ! command -v cpio >/dev/null 2>&1; then
+    echo "ERROR: cpio not found (needed for the embedded initramfs)." >&2
+    exit 1
+fi
+INITRD_TMP=$(mktemp -d)
+trap 'rm -rf "$INITRD_TMP"' EXIT
+cp "$OUT" "$INITRD_TMP/ptrace_init"
+(cd "$INITRD_TMP" && find ptrace_init | cpio -o -H newc --owner=0:0 2>/dev/null) > "$ROOT/initrd.cpio"
+python3 - "$ROOT/initrd.cpio" "$ROOT/initrd_so.h" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+with open(sys.argv[2], 'w') as f:
+    f.write('/* generated from initrd.cpio by build.sh - do not edit */\n')
+    f.write('static const unsigned char initrd_cpio[] = {\n')
+    for i in range(0, len(data), 16):
+        f.write('\t' + ','.join('0x%02x' % b for b in data[i:i + 16]) + ',\n')
+    f.write('};\n')
+    f.write('static const unsigned int initrd_cpio_len = %d;\n' % len(data))
+PY
+echo "built: $ROOT/initrd.cpio ($(wc -c < "$ROOT/initrd.cpio") bytes), embedded in the loader"
+
+# 5. the EFI loader (installed as \EFI\BOOT\BOOTKIT.EFI; replaces the EFI shell
+#    + startup.nsh trick).  Freestanding x86_64 PE32+ built with clang/lld-link,
+#    no libc and no gnu-efi; the initramfs is embedded (initrd_so.h, step 4).
+if ! command -v clang >/dev/null 2>&1; then
+    echo "ERROR: clang not found (needed to build bootkit.efi)." >&2
+    exit 1
+fi
+clang --target=x86_64-unknown-windows -ffreestanding -fno-stack-protector \
+    -mno-red-zone -mno-sse -fshort-wchar -Os -Wall -Wextra -nostdlib \
+    -fuse-ld=lld-link \
+    -Wl,/subsystem:efi_application,/entry:efi_main,/nodefaultlib \
+    -o "$ROOT/bootkit.efi" "$ROOT/efiboot.c"
+echo "built: $ROOT/bootkit.efi ($(wc -c < "$ROOT/bootkit.efi") bytes)"

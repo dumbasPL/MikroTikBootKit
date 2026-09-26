@@ -135,27 +135,39 @@ load on 7.24.4, which is why the bind-mount route replaced it.
 Build:
 
 ```sh
-./build.sh                                        # -> ptrace_init (static i386)
+./build.sh                        # -> ptrace_init (static i386)
+                                  #    bootkit.efi (EFI loader, see efiboot.c)
 ```
 
-Install: put the binary in the initramfs (an external initrd overlays the
-built-in one) and boot with `rdinit=/ptrace_init`.  The stock initramfs is not
-modified - `/init` stays the real init, which the wrapper execs unchanged.
+Install: `./build.sh` packs the binary into a cpio and embeds that in the EFI
+loader (`bootkit.efi`), which boots it with `rdinit=/ptrace_init`.  The stock
+initramfs is not modified - `/init` stays the real init, which the wrapper
+execs unchanged.
 
 ## Test setup used here
 
 The runnable recipe is in `../AGENTS.md`; this is the record of what was used.
-A copy of the CHR-converted x86 install image with the initrd added to its EFI
+A copy of the CHR-converted x86 install image with the bootkit added to its EFI
 system partition (p1 starts at LBA 0x800, so `mtools` addresses it as
 `image@@1048576`):
 
 ```
-/EFI/BOOT/BOOTX64.EFI   = EFI shell (runs startup.nsh)
-/EFI/BOOT/KERNEL.EFI    = stock RouterOS kernel (EFI stub, 4024544 bytes)
-/initrd.cpio            = cpio with /ptrace_init
-/startup.nsh            = fs0:\EFI\BOOT\kernel.efi console=ttyS0,115200n8 \
-                          initrd=\initrd.cpio rdinit=/ptrace_init
+/EFI/BOOT/BOOTKIT.EFI   = bootkit EFI loader (efiboot.c -> bootkit.efi),
+                          with the /ptrace_init cpio embedded; started by a
+                          Boot#### entry created once (bcfg / efibootmgr)
+/EFI/BOOT/BOOTX64.EFI   = stock RouterOS kernel (EFI stub, ~4 MB), left in
+                          place so RouterOS updates keep overwriting it
 ```
+
+The loader copies the embedded cpio below 4 GB, fills in `struct boot_params`
+(kernel command line, ramdisk address and size) and jumps to the kernel's EFI
+handover entry.  The entry point is the kernel's own EFI stub, which relocates
+the kernel, exits boot services and jumps into the decompressor - so the
+kernel still sees a full EFI environment.  Earlier the ESP ran an EFI shell +
+`startup.nsh` instead; `efiboot.c` replaced that (the log below is unchanged
+by it), and the stock kernel used to be renamed to `KERNEL.EFI` because the
+loader had to be `BOOTX64.EFI`.  With the loader under its own name the kernel
+file is never touched.
 
 Booting QEMU's `-kernel BOOTX64.EFI -initrd ... -append rdinit=...` was tried
 first and does not work for this image: the wrapper runs, but the stock init
@@ -164,7 +176,7 @@ then fails with `opendir: No such file or directory` /
 fine (a diagnostic init confirmed `/dev/vda`, `vda1`, `vda2` and a working
 `mount("/dev/vda2","/flash","ext4",MS_RDONLY)`), and the same image boots via
 OVMF, so the init needs the EFI environment to find the package.  Hence the
-EFI-shell route.
+EFI-boot route.
 
 ```
 qemu-system-x86_64 -m 1024 -smp 2 -cpu host -enable-kvm \
@@ -178,9 +190,10 @@ qemu-system-x86_64 -m 1024 -smp 2 -cpu host -enable-kvm \
   -serial chardev:ser
 ```
 
-Rebuild loop: `./build.sh`, re-make the cpio, `mcopy` it over
-`::/initrd.cpio`, boot, then check the serial log for the `[ptrace-init]` and
-`[ldpreload]` lines and for `CHR Login:`.
+Rebuild loop: `./build.sh` (it re-packs `ptrace_init` and re-embeds it in
+`bootkit.efi`), `mcopy` `bootkit.efi` over `::/EFI/BOOT/BOOTKIT.EFI` (the boot
+entry and the kernel stay untouched), boot, then check the serial log for the
+`[ptrace-init]` and `[ldpreload]` lines and for `CHR Login:`.
 
 The paths are compile-time constants at the top of `ptrace_init.c`
 (`REAL_INIT`, `PRELOAD_PATH`); the mount strings the tracer matches
@@ -193,10 +206,11 @@ moving to another RouterOS version.
 image is never touched):
 
 ```sh
-./vmtest.sh prepare              # build, copy the image, write the ESP files
+./vmtest.sh prepare              # build, copy the image, write BOOTKIT.EFI and install the boot entry
+./vmtest.sh entry                # (re)install the Boot#### entry into vars.fd
 ./vmtest.sh boot                 # start QEMU (background, serial on a socket)
 ./vmtest.sh wait 60              # wait for the login prompt
-./vmtest.sh check                # show the tracer + ldpreload lines
+./vmtest.sh check                # show the loader + tracer + ldpreload lines
 ./vmtest.sh cmd "/system license print"   # log in (admin/admin) and run one CLI command
 ./vmtest.sh login                # attach to the serial console (Ctrl-] quits)
 ./vmtest.sh stop                 # kill the VM
@@ -205,7 +219,8 @@ image is never touched):
 
 Environment knobs: `IMG_SRC` (source image, default
 `x86-7.24.4-clean.img`), `WORK` (scratch dir, default `/tmp/opencode/bkvm`),
-`MODE=chr|x86|keep` (override the MBR mode flag), `MEM`, `SMP`.  `vmconsole.py`
+`MODE=chr|x86|keep` (override the MBR mode flag), `MEM`, `SMP`, `SHELL_EFI`
+(EFI shell binary used only for the boot entry install).  `vmconsole.py`
 is the serial helper used by `vmtest.sh cmd`: it logs in as admin/admin,
 declines the forced password change and runs the command.
 

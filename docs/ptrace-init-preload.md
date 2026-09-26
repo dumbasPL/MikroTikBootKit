@@ -264,7 +264,10 @@ Environment knobs: `IMG_SRC` (source image, default
 `ISO_SRC` / `ISO_OUT` / `IMG_SIZE` (the `iso-install` ISO, output image and
 its size), `WORK` (scratch dir, default `.work/` next to the script),
 `MODE=chr|x86|keep` (override the MBR mode flag), `INSTALL_MODE=1|2` (direct or
-removable), `DEBUG=0|1` (build variant, harness default 1), `MEM`, `SMP`.
+removable), `DEBUG=0|1` (build variant, harness default 1), `ACCEL=kvm|tcg`
+(QEMU accelerator, default `kvm`; hosted CI runners use `tcg`), `OVMF_CODE` /
+`OVMF_VARS` (UEFI firmware, otherwise the usual edk2-ovmf/ovmf paths are
+tried), `MEM`, `SMP`, `WAIT` (seconds `test` waits for the login prompt).
 `vmconsole.py` is the serial helper used by `vmtest.sh cmd` (logs in as
 admin/admin, declines the forced password change and runs the command; a
 never-booted image is detected and set up to admin/admin on the fly), by

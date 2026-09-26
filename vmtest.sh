@@ -48,7 +48,13 @@
 #                               (default), 2 removable
 #   DEBUG=0|1                   build variant (default 1 in the harness: serial
 #                               console + verbose tracer/probe logs)
+#   ACCEL=kvm|tcg               QEMU accelerator (default: kvm; use tcg where
+#                               there is no /dev/kvm, e.g. hosted CI runners)
+#   OVMF_CODE=<path> OVMF_VARS=<path>
+#                               UEFI firmware (default: the first edk2-ovmf /
+#                               ovmf pair of paths that exists)
 #   MEM=1024  SMP=2             QEMU memory / cpus
+#   WAIT=90                     seconds "test" waits for the login prompt
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
@@ -62,6 +68,8 @@ MEM=${MEM:-1024}
 SMP=${SMP:-2}
 DEBUG=${DEBUG:-1}
 IMG_SIZE=${IMG_SIZE:-128M}
+ACCEL=${ACCEL:-kvm}
+WAIT=${WAIT:-90}
 
 SERIAL_SOCK=$WORK/serial.sock
 SERIAL_LOG=$WORK/serial.log
@@ -70,12 +78,43 @@ PIDFILE=$WORK/qemu.pid
 log() { printf '%s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+case "$ACCEL" in
+    kvm) ;;
+    tcg) ;;
+    *)   die "ACCEL must be kvm or tcg" ;;
+esac
+
+# UEFI firmware: OVMF_CODE/OVMF_VARS override; otherwise the first pair that
+# exists (Arch's edk2-ovmf or Debian/Ubuntu's ovmf)
+if [ -z "${OVMF_CODE:-}" ] || [ -z "${OVMF_VARS:-}" ]; then
+    for pair in \
+        /usr/share/edk2/x64/OVMF_CODE.4m.fd:/usr/share/edk2/x64/OVMF_VARS.4m.fd \
+        /usr/share/OVMF/OVMF_CODE_4M.fd:/usr/share/OVMF/OVMF_VARS_4M.fd \
+        /usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd; do
+        code=${pair%%:*}; vars=${pair##*:}
+        if [ -f "$code" ] && [ -f "$vars" ]; then
+            OVMF_CODE=${OVMF_CODE:-$code}
+            OVMF_VARS=${OVMF_VARS:-$vars}
+            break
+        fi
+    done
+fi
+[ -f "${OVMF_CODE:-}" ] && [ -f "${OVMF_VARS:-}" ] ||
+    die "UEFI firmware not found; set OVMF_CODE and OVMF_VARS"
+
+# -cpu host needs KVM; -cpu max is the usual emulated (TCG) choice
+if [ "$ACCEL" = kvm ]; then
+    QEMU_ACCEL=(-accel kvm -cpu host)
+else
+    QEMU_ACCEL=(-accel tcg -cpu max)
+fi
+
 qemu_cmd() {
-    echo qemu-system-x86_64 -m "$MEM" -smp "$SMP" -cpu host -enable-kvm \
+    echo qemu-system-x86_64 -m "$MEM" -smp "$SMP" "${QEMU_ACCEL[@]}" \
         -drive if=none,id=d1,file="$IMG",format=raw \
         -device qemu-xhci,id=usb-bus \
         -device usb-storage,bus=usb-bus.0,drive=d1,serial=test \
-        -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+        -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
         -drive if=pflash,format=raw,file="$WORK/vars.fd" \
         -display none \
         -chardev "socket,id=ser,path=$SERIAL_SOCK,server=on,wait=off,logfile=$SERIAL_LOG" \
@@ -85,13 +124,13 @@ qemu_cmd() {
 # same, plus the installer stick as the second USB drive (target stays on USB
 # port 1 so the device path in the created boot entry stays valid later)
 qemu_cmd_install() {
-    echo qemu-system-x86_64 -m "$MEM" -smp "$SMP" -cpu host -enable-kvm \
+    echo qemu-system-x86_64 -m "$MEM" -smp "$SMP" "${QEMU_ACCEL[@]}" \
         -drive if=none,id=d1,file="$IMG",format=raw \
         -drive if=none,id=d2,file="$STICK",format=raw \
         -device qemu-xhci,id=usb-bus \
         -device usb-storage,bus=usb-bus.0,drive=d1,serial=test \
         -device usb-storage,bus=usb-bus.0,drive=d2,serial=bk-stick \
-        -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+        -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
         -drive if=pflash,format=raw,file="$WORK/vars.fd" \
         -display none \
         -chardev "socket,id=ser,path=$SERIAL_SOCK,server=on,wait=off,logfile=$SERIAL_LOG" \
@@ -101,13 +140,13 @@ qemu_cmd_install() {
 # stick + target with the stick first (bootindex), for the removable install:
 # the stick's loader reads its config and boots the kernel on the target disk
 qemu_cmd_removable() {
-    echo qemu-system-x86_64 -m "$MEM" -smp "$SMP" -cpu host -enable-kvm \
+    echo qemu-system-x86_64 -m "$MEM" -smp "$SMP" "${QEMU_ACCEL[@]}" \
         -drive if=none,id=d1,file="$IMG",format=raw \
         -drive if=none,id=d2,file="$STICK",format=raw \
         -device qemu-xhci,id=usb-bus \
         -device usb-storage,bus=usb-bus.0,drive=d1,serial=test,bootindex=1 \
         -device usb-storage,bus=usb-bus.0,drive=d2,serial=bk-stick,bootindex=0 \
-        -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+        -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
         -drive if=pflash,format=raw,file="$WORK/vars.fd" \
         -display none \
         -chardev "socket,id=ser,path=$SERIAL_SOCK,server=on,wait=off,logfile=$SERIAL_LOG" \
@@ -119,13 +158,13 @@ qemu_cmd_removable() {
 # separate varstore; the ISO's EFI boot image (refind) boots the installer
 # under OVMF, which is what makes it create the FAT EFI partition layout
 qemu_cmd_iso() {
-    echo qemu-system-x86_64 -m "$MEM" -smp "$SMP" -cpu host -enable-kvm \
+    echo qemu-system-x86_64 -m "$MEM" -smp "$SMP" "${QEMU_ACCEL[@]}" \
         -boot order=d \
         -cdrom "$WORK/ros-install.iso" \
         -drive if=none,id=d1,file="$1",format=raw \
         -device qemu-xhci,id=usb-bus \
         -device usb-storage,bus=usb-bus.0,drive=d1,serial=test \
-        -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+        -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
         -drive if=pflash,format=raw,file="$WORK/iso-vars.fd" \
         -display none \
         -chardev "socket,id=ser,path=$SERIAL_SOCK,server=on,wait=off,logfile=$SERIAL_LOG" \
@@ -136,11 +175,11 @@ qemu_cmd_iso() {
 # removable-media fallback boots \EFI\BOOT\BOOTX64.EFI from the target, which
 # is what the stock image does; used for the first login of a new image
 qemu_cmd_stock() {
-    echo qemu-system-x86_64 -m "$MEM" -smp "$SMP" -cpu host -enable-kvm \
+    echo qemu-system-x86_64 -m "$MEM" -smp "$SMP" "${QEMU_ACCEL[@]}" \
         -drive if=none,id=d1,file="$1",format=raw \
         -device qemu-xhci,id=usb-bus \
         -device usb-storage,bus=usb-bus.0,drive=d1,serial=test \
-        -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+        -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
         -drive if=pflash,format=raw,file="$WORK/iso-vars.fd" \
         -display none \
         -chardev "socket,id=ser,path=$SERIAL_SOCK,server=on,wait=off,logfile=$SERIAL_LOG" \
@@ -203,7 +242,6 @@ cmd_iso_install() {
     local iso=${1:-${ISO_SRC:-$(default_iso)}}
     local out=${2:-${ISO_OUT:-$WORK/clean.img}}
     [ -f "$iso" ] || die "installer ISO not found: $iso"
-    [ -f /usr/share/edk2/x64/OVMF_CODE.4m.fd ] || die "OVMF not found (edk2-ovmf)"
     mkdir -p "$WORK"
     log "== installing RouterOS from $iso"
     make_install_iso "$iso" "$WORK/ros-install.iso"
@@ -213,7 +251,7 @@ cmd_iso_install() {
 
     stop_qemu
     rm -f "$WORK/iso-vars.fd"
-    cp -f /usr/share/edk2/x64/OVMF_VARS.4m.fd "$WORK/iso-vars.fd"
+    cp -f "$OVMF_VARS" "$WORK/iso-vars.fd"
     : > "$SERIAL_LOG"
     rm -f "$SERIAL_SOCK"
     # shellcheck disable=SC2046
@@ -232,7 +270,7 @@ cmd_iso_install() {
     # like the older hand-made clean images
     log "== first boot (licence, admin/admin)"
     rm -f "$WORK/iso-vars.fd"
-    cp -f /usr/share/edk2/x64/OVMF_VARS.4m.fd "$WORK/iso-vars.fd"
+    cp -f "$OVMF_VARS" "$WORK/iso-vars.fd"
     : > "$SERIAL_LOG"
     rm -f "$SERIAL_SOCK"
     # shellcheck disable=SC2046
@@ -256,7 +294,7 @@ source_image() {
                 log "== using the existing clean image $clean"
                 log "   (rebuild it with: $0 iso-install $src)"
             else
-                cmd_iso_install "$src" "$clean"
+                cmd_iso_install "$src" "$clean" >&2
             fi
             printf '%s\n' "$clean" ;;
         *)  printf '%s\n' "$src" ;;
@@ -289,7 +327,7 @@ cmd_prepare() {
 
     log "== fresh varstore (the installer creates the boot entry)"
     rm -f "$WORK/vars.fd"
-    cp -f /usr/share/edk2/x64/OVMF_VARS.4m.fd "$WORK/vars.fd"
+    cp -f "$OVMF_VARS" "$WORK/vars.fd"
     log "== ready: $IMG, $STICK"
 }
 
@@ -309,7 +347,7 @@ cmd_install() {
 
     stop_qemu
     rm -f "$WORK/vars.fd"
-    cp -f /usr/share/edk2/x64/OVMF_VARS.4m.fd "$WORK/vars.fd"
+    cp -f "$OVMF_VARS" "$WORK/vars.fd"
     : > "$SERIAL_LOG"
     rm -f "$SERIAL_SOCK"
     # shellcheck disable=SC2046
@@ -332,7 +370,7 @@ cmd_boot() {
     [ -f "$IMG" ] || die "no test image, run: $0 prepare"
     stop_qemu
     if [ ! -f "$WORK/vars.fd" ]; then
-        cp -f /usr/share/edk2/x64/OVMF_VARS.4m.fd "$WORK/vars.fd"
+        cp -f "$OVMF_VARS" "$WORK/vars.fd"
         log "== fresh varstore (no boot entry; run: $0 install)"
     fi
     : > "$SERIAL_LOG"
@@ -410,7 +448,7 @@ cmd_test() {
     cmd_prepare
     cmd_install
     cmd_boot
-    cmd_wait 90 || true
+    cmd_wait "$WAIT" || true
     cmd_check
 }
 
@@ -418,7 +456,7 @@ cmd_test_removable() {
     cmd_prepare
     INSTALL_MODE=2 cmd_install
     cmd_boot_removable
-    cmd_wait 90 || true
+    cmd_wait "$WAIT" || true
     cmd_check
 }
 

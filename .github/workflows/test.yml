@@ -1,0 +1,230 @@
+name: Test
+
+# Whole-chain test in both image modes (CHR and x86), by default on the latest
+# RouterOS release.
+#
+# The version is resolved first: the version input if one was given, otherwise
+# the newest release on the channel asked for (the ROUTEROS_CHANNEL repository
+# variable, default "stable") straight from upgrade.mikrotik.com - the same
+# NEWESTa7.<channel> endpoint the routers use.  Each matrix job then:
+#   1. builds the kit (ptrace_init, the loader and bootkit.img),
+#   2. installs a clean RouterOS image from the stock installer ISO with
+#      ./vmtest.sh iso-install (EFI mode, so the layout matches the images the
+#      harness was developed against),
+#   3. installs the bootkit on a copy with ./vmtest.sh test (direct) and
+#      ./vmtest.sh test-removable (removable), boots the target and checks the
+#      loader + tracer + LD_PRELOAD probe lines on the serial console,
+#   4. logs in with admin/admin and checks the licence the probe installed
+#      (p-unlimited on CHR, no demo countdown on x86).
+#
+# GitHub-hosted runners have no usable KVM, so the QEMU accelerator is probed
+# and falls back to emulation (TCG); a self-hosted runner with /dev/kvm uses
+# KVM and runs much faster.  daily.yml calls this workflow once a day.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: RouterOS version to test (empty = the latest on the channel)
+        required: false
+        default: ""
+        type: string
+      channel:
+        description: Release channel to resolve the latest version from
+        required: true
+        default: stable
+        type: choice
+        options:
+          - long-term
+          - stable
+          - testing
+          - development
+  workflow_call:
+    inputs:
+      version:
+        description: RouterOS version to test (empty = the latest on the channel)
+        required: false
+        default: ""
+        type: string
+      channel:
+        description: Release channel to resolve the latest version from
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Resolve the RouterOS version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve the version
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel || vars.ROUTEROS_CHANNEL || 'stable' }}
+        run: |
+          set -euo pipefail
+          case "$CHANNEL" in
+            long-term|stable|testing|development) ;;
+            *) echo "::error::unknown RouterOS release channel '$CHANNEL'"; exit 1 ;;
+          esac
+          version="$INPUT_VERSION"
+          if [ -z "$version" ]; then
+            echo "checking the latest RouterOS version on the $CHANNEL channel"
+            body=$(curl -fsS --retry 3 --max-time 60 \
+              "https://upgrade.mikrotik.com/routeros/NEWESTa7.$CHANNEL")
+            version=$(printf '%s\n' "$body" | awk 'NR == 1 { print $1 }')
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?([a-z]+[0-9]+)?$ ]]; then
+            echo "::error::invalid RouterOS version '$version'"
+            exit 1
+          fi
+          echo "testing RouterOS $version (channel $CHANNEL)"
+          {
+            echo "### RouterOS $version"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| channel | $CHANNEL |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  vmtest:
+    name: ${{ matrix.mode }} (RouterOS ${{ needs.version.outputs.version }})
+    needs: version
+    runs-on: ubuntu-latest
+    # emulated (TCG) runs are slow; an ISO install + two boot tests fit easily
+    timeout-minutes: 180
+    # one run per mode and ref; a newer push cancels the older run
+    concurrency:
+      group: test-${{ github.ref }}-${{ matrix.mode }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [chr, x86]
+    env:
+      ROUTEROS_VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc-multilib libc6-dev-i386 clang lld \
+            qemu-system-x86 ovmf mtools genisoimage cpio
+
+      - name: Cache the i386 musl toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            .toolchain/cache
+            .toolchain/i386-musl
+          key: musl-i386-${{ runner.os }}-${{ hashFiles('tools/musl_i386.sh') }}
+
+      # The MikroTik CDN is slow from the runners and the ISO never changes.
+      - name: Cache the installer ISO
+        uses: actions/cache@v4
+        with:
+          path: .work/mikrotik-${{ env.ROUTEROS_VERSION }}.iso
+          key: routeros-iso-${{ runner.os }}-${{ env.ROUTEROS_VERSION }}
+
+      - name: Download the installer ISO
+        run: |
+          set -euo pipefail
+          iso=".work/mikrotik-$ROUTEROS_VERSION.iso"
+          if [ ! -f "$iso" ]; then
+            mkdir -p .work
+            url="https://download.mikrotik.com/routeros/$ROUTEROS_VERSION/mikrotik-$ROUTEROS_VERSION.iso"
+            echo "downloading $url"
+            curl -fL --retry 3 -o "$iso.part" "$url"
+            mv "$iso.part" "$iso"
+          fi
+          ls -l "$iso"
+          sha256sum "$iso" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pick the QEMU accelerator
+        run: |
+          set -uo pipefail
+          accel=tcg
+          if [ -w /dev/kvm ]; then
+            rc=0
+            timeout 10 qemu-system-x86_64 -accel kvm -cpu host -m 16 \
+              -display none -serial none -monitor none -S </dev/null \
+              >/dev/null 2>&1 || rc=$?
+            # 124 means qemu was still running when the timeout fired: KVM works
+            if [ "$rc" = 124 ]; then accel=kvm; fi
+          fi
+          echo "ACCEL=$accel" >> "$GITHUB_ENV"
+          echo "using ACCEL=$accel"
+
+      - name: Install a clean image and test the direct install
+        env:
+          MODE: ${{ matrix.mode }}
+          IMG_SRC: ${{ github.workspace }}/.work/mikrotik-${{ env.ROUTEROS_VERSION }}.iso
+          WAIT: "900"
+        run: |
+          set -euo pipefail
+          ./vmtest.sh test
+          cp .work/serial.log serial-direct.log
+          grep -aq 'efiboot:' .work/serial.log
+          grep -aq 'ptrace-init' .work/serial.log
+          grep -aq 'ldpreload. loaded by' .work/serial.log
+          [ "$(grep -ac 'ldpreload. loaded by' .work/serial.log)" -ge 5 ]
+          grep -aq 'mode: licence' .work/serial.log
+          grep -aqE 'BdsDxe: (loading|starting) Boot.*MikroTikBootKit' .work/serial.log
+
+      - name: Check the licence and stop the direct VM
+        run: |
+          set -euo pipefail
+          ./vmtest.sh cmd "/system license print" | tee license-direct.txt
+          ./vmtest.sh stop
+          grep -aqE '(system|software)-id' license-direct.txt
+          case "${{ matrix.mode }}" in
+            chr) grep -aq 'level: p-unlimited' license-direct.txt ;;
+            x86) ! grep -aq 'expires-in' license-direct.txt ;;
+          esac
+          cp .work/serial.log serial-direct-login.log
+
+      - name: Test the removable install
+        env:
+          MODE: ${{ matrix.mode }}
+          IMG_SRC: ${{ github.workspace }}/.work/mikrotik-${{ env.ROUTEROS_VERSION }}.iso
+          WAIT: "900"
+        run: |
+          set -euo pipefail
+          ./vmtest.sh test-removable
+          cp .work/serial.log serial-removable.log
+          grep -aq 'ptrace-init' .work/serial.log
+          grep -aq 'ldpreload. loaded by' .work/serial.log
+          [ "$(grep -ac 'ldpreload. loaded by' .work/serial.log)" -ge 5 ]
+          grep -aq 'mode: licence' .work/serial.log
+          ./vmtest.sh cmd "/system license print" | tee license-removable.txt
+          ./vmtest.sh stop
+          grep -aqE '(system|software)-id' license-removable.txt
+          case "${{ matrix.mode }}" in
+            chr) grep -aq 'level: p-unlimited' license-removable.txt ;;
+            x86) ! grep -aq 'expires-in' license-removable.txt ;;
+          esac
+          cp .work/serial.log serial-removable-login.log
+
+      - name: Upload the serial logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmtest-${{ matrix.mode }}
+          path: |
+            serial-*.log
+            license-*.txt
+          if-no-files-found: ignore
+          retention-days: 14

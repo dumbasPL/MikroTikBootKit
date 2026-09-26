@@ -1,0 +1,21 @@
+name: Daily test on the latest RouterOS
+
+# Runs the whole test chain (test.yml) once a day on the newest RouterOS
+# release.  The test workflow resolves the version itself from
+# upgrade.mikrotik.com; the ROUTEROS_CHANNEL repository variable picks the
+# channel (default "stable"), and dispatching test.yml directly can test a
+# specific version.  This workflow only provides the schedule.
+
+on:
+  schedule:
+    # daily, off the hour (GitHub delays jobs scheduled on the hour)
+    - cron: "43 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Latest RouterOS
+    uses: ./.github/workflows/test.yml

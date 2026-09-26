@@ -84,6 +84,9 @@ vmtest.sh                   prepare/install/boot/interact with a test image copy
                             install a clean image from an installer ISO
 vmconsole.py                serial-console helper used by vmtest.sh cmd and the
                             bootkit/RouterOS installer drivers
+.github/workflows/test.yml  whole-chain CI: iso-install + direct/removable
+                            tests on CHR and x86 (TCG on hosted runners)
+.github/workflows/daily.yml daily call of test.yml on the latest RouterOS
 docs/ptrace-init-preload.md design + findings + verified log
 ```
 
@@ -146,8 +149,10 @@ musl).  The binary is static, so it runs in the initramfs with no libraries.
 
 ## Test
 
-Needs: KVM (`-enable-kvm` is mandatory), `clang` + `lld` (or
-`x86_64-w64-mingw32-gcc`), `edk2-ovmf`,
+Needs: KVM (the default accelerator; use `ACCEL=tcg` where there is no
+`/dev/kvm`, e.g. hosted CI runners), `clang` + `lld` (or
+`x86_64-w64-mingw32-gcc`), OVMF (Arch's `edk2-ovmf` or Debian/Ubuntu's `ovmf`
+- the paths are found automatically and `OVMF_CODE`/`OVMF_VARS` override),
 `mtools` (`mformat`/`mmd`/`mcopy` also build `bootkit.img`), `cpio`, and a
 RouterOS x86 image.  Use a *copy* of the image; the ESP (partition 1) is
 rewritten.  Always kill the VM by pidfile when done — do not leave QEMU
@@ -222,6 +227,18 @@ that does not exist yet, so a full run from an ISO is:
 ```sh
 IMG_SRC=./mikrotik-7.24.4.iso MODE=chr ./vmtest.sh test
 ```
+
+`.github/workflows/test.yml` runs all of that on every push/PR in a CHR and an
+x86 job: it caches the i386-musl toolchain and the installer ISO, installs the
+clean image once per job and then runs the direct and the removable test with
+loader/tracer/probe and licence assertions (and uploads the serial logs).
+GitHub-hosted runners have no usable KVM, so the workflow probes it and falls
+back to `ACCEL=tcg` with a longer `WAIT`.  The RouterOS version is resolved
+first from `upgrade.mikrotik.com` (`NEWESTa7.<channel>`, the endpoint the
+routers use): the newest release on the `ROUTEROS_CHANNEL` repository variable
+(default `stable`), or an explicit `version` input when dispatching.
+`.github/workflows/daily.yml` calls the test workflow once a day on that latest
+version.
 
 ### Installing on real hardware
 

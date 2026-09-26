@@ -16,7 +16,9 @@ static BOOLEAN load_options_have(EFI_LOADED_IMAGE_PROTOCOL *li, const CHAR16 *to
 
 	if (!opt)
 		return FALSE;
-	for (i = 0; i + str_len16(token) <= n; i++) {
+	/* strictly less: str_equal_ci() reads the character after the token
+	 * too, so a match starting at n - len would read opt[n] */
+	for (i = 0; i + str_len16(token) < n; i++) {
 		if (str_equal_ci(opt + i, token))
 			return TRUE;
 	}

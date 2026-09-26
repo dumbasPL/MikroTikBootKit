@@ -51,6 +51,8 @@ static EFI_STATUS read_variable(CHAR16 *name, EFI_GUID *guid, UINT32 *attrs,
 	UINTN cap = sizeof(stack);
 	EFI_STATUS status;
 
+	*data = 0;
+	*size = 0;
 	status = RS->GetVariable(name, guid, attrs, &cap, stack);
 	if (status == EFI_BUFFER_TOO_SMALL) {
 		*data = pool_alloc(cap);
@@ -65,18 +67,12 @@ static EFI_STATUS read_variable(CHAR16 *name, EFI_GUID *guid, UINT32 *attrs,
 		*size = cap;
 		return EFI_SUCCESS;
 	}
-	if (status == EFI_NOT_FOUND) {
-		*data = 0;
-		*size = 0;
+	if (status == EFI_NOT_FOUND)
 		return status;
-	}
 	if (EFI_ERROR(status))
 		return status;
-	if (cap == 0) {
-		*data = 0;
-		*size = 0;
+	if (cap == 0)
 		return EFI_SUCCESS;
-	}
 	*data = pool_alloc(cap);
 	if (!*data)
 		return EFI_OUT_OF_RESOURCES;
@@ -131,8 +127,14 @@ EFI_STATUS boot_entry_add(EFI_HANDLE vol_handle, CHAR16 *file_path)
 		if (max_index == 0xffff || i > max_index)
 			max_index = i;
 		status = read_variable(name, &global_variable_guid, &attrs, &data, &data_size);
-		if (EFI_ERROR(status) || data_size < 6)
+		if (EFI_ERROR(status))
 			continue;
+		if (data_size < 6) {
+			if (data)
+				BS->FreePool(data);
+			data = 0;
+			continue;
+		}
 		{
 			UINT16 fplen = *(UINT16 *)((UINT8 *)data + 4);
 			CHAR16 *d = (CHAR16 *)((UINT8 *)data + 6);

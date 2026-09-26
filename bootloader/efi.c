@@ -154,8 +154,12 @@ VOID print_trunc(const CHAR16 *s, UINTN max)
 {
 	CHAR16 buf[80];
 	UINTN i = 0;
+	/* keep room for the "..." marker and the terminator */
+	UINTN cap = sizeof(buf) / sizeof(buf[0]) - 4;
 
-	while (i < max && i < sizeof(buf) / sizeof(buf[0]) - 1 && s[i]) {
+	if (max > cap)
+		max = cap;
+	while (i < max && s[i]) {
 		buf[i] = s[i];
 		i++;
 	}

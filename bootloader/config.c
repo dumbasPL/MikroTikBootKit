@@ -224,12 +224,20 @@ EFI_STATUS config_read(EFI_FILE_PROTOCOL *root, TARGET_ID *id, BOOLEAN *debug)
 
 static UINTN c_append(char *buf, UINTN cap, UINTN pos, const char *s, UINTN len)
 {
-	if (pos >= cap - 1)
+	if (cap == 0 || pos >= cap - 1)
 		return pos;
 	if (len > cap - 1 - pos)
 		len = cap - 1 - pos;
 	memcpy(buf + pos, s, len);
 	return pos + len;
+}
+
+/* append one character when there is room for it in buf[0..cap) */
+static UINTN c_append_ch(char *buf, UINTN cap, UINTN pos, char c)
+{
+	if (pos < cap)
+		buf[pos] = c;
+	return pos + 1;
 }
 
 static UINTN c_append_hex_u64(char *buf, UINTN cap, UINTN pos, UINT64 v)
@@ -244,7 +252,7 @@ static UINTN c_append_hex_u64(char *buf, UINTN cap, UINTN pos, UINT64 v)
 		tmp[n++] = digits[v & 0xf];
 		v >>= 4;
 	}
-	while (n && pos < cap - 1)
+	while (n && pos + 1 < cap)
 		buf[pos++] = tmp[--n];
 	return pos;
 }
@@ -257,14 +265,14 @@ static UINTN fmt_target_id(char *buf, UINTN cap, const TARGET_ID *id)
 	UINTN pos = 0, i;
 
 	pos = c_append(buf, cap, pos, type, 3);
-	buf[pos++] = ':';
+	pos = c_append_ch(buf, cap, pos, ':');
 	for (i = 0; i < sig_len; i++) {
-		buf[pos++] = digits[id->sig[i] >> 4];
-		buf[pos++] = digits[id->sig[i] & 0xf];
+		pos = c_append_ch(buf, cap, pos, digits[id->sig[i] >> 4]);
+		pos = c_append_ch(buf, cap, pos, digits[id->sig[i] & 0xf]);
 	}
-	buf[pos++] = ':';
+	pos = c_append_ch(buf, cap, pos, ':');
 	pos = c_append_hex_u64(buf, cap, pos, id->start);
-	buf[pos++] = ':';
+	pos = c_append_ch(buf, cap, pos, ':');
 	pos = c_append_hex_u64(buf, cap, pos, id->size);
 	return pos;
 }
@@ -275,6 +283,9 @@ EFI_STATUS config_write(EFI_FILE_PROTOCOL *root, const TARGET_ID *id,
 	EFI_DEVICE_PATH_TO_TEXT_PROTOCOL *d2t = 0;
 	char buf[CONFIG_MAX];
 	UINTN pos = 0;
+	/* reserve room for the lines that follow the comment: the target line
+	 * (up to 70 bytes), its CRLF and the debug line */
+	UINTN head_cap = sizeof(buf) - 128;
 
 	pos = c_append(buf, sizeof(buf), pos, "# MikroTik boot kit\r\n", 21);
 	BS->LocateProtocol(&device_path_to_text_guid, 0, (VOID **)&d2t);
@@ -282,10 +293,11 @@ EFI_STATUS config_write(EFI_FILE_PROTOCOL *root, const TARGET_ID *id,
 		CHAR16 *text = d2t->ConvertDevicePathToText(dp, FALSE, TRUE);
 
 		if (text) {
-			pos = c_append(buf, sizeof(buf) - 3, pos, "# target ESP: ", 14);
-			for (; *text && pos < sizeof(buf) - 3; text++)
+			pos = c_append(buf, head_cap, pos, "# target ESP: ", 14);
+			for (; *text && pos + 1 < head_cap; text++)
 				buf[pos++] = (char)*text;
 			pos = c_append(buf, sizeof(buf), pos, "\r\n", 2);
+			BS->FreePool(text);
 		}
 	}
 	pos = c_append(buf, sizeof(buf), pos, "target=", 7);

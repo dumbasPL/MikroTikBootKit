@@ -138,9 +138,14 @@ EFI_STATUS boot_from_root(EFI_HANDLE image, EFI_FILE_PROTOCOL *root, BOOLEAN deb
 		return fail(status, L"cannot allocate boot params");
 	memset(params, 0, sizeof(*params));
 
-	/* only the setup header bytes the kernel advertises carry meaning */
+	/*
+	 * The kernel's 2-byte short jump at 0x200 lands right after its setup
+	 * header, so its displacement byte plus the 0x11 bytes before it is
+	 * the length of the header the file carries (123 bytes for the 2.15+
+	 * layout these kernels use).  Fields the file does not have stay zero.
+	 */
 	{
-		UINTN hdr_len = 0x11 + hdr.setup_size;
+		UINTN hdr_len = 0x11 + hdr.jump_disp;
 
 		if (hdr_len > sizeof(struct SetupHeader))
 			hdr_len = sizeof(struct SetupHeader);

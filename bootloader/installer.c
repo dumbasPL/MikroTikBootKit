@@ -62,8 +62,10 @@ EFI_STATUS installer_run(EFI_HANDLE image, EFI_LOADED_IMAGE_PROTOCOL *li)
 	if (EFI_ERROR(status))
 		return fail(status, L"cannot open my own file");
 	status = file_size(f, &size64);
-	if (EFI_ERROR(status))
+	if (EFI_ERROR(status)) {
+		f->Close(f);
 		return fail(status, L"cannot size my own file");
+	}
 	src_len = (UINTN)size64;
 	status = alloc_pages(EfiLoaderData, src_len, 0xffffffffULL, &src);
 	if (EFI_ERROR(status))
@@ -128,10 +130,14 @@ EFI_STATUS installer_run(EFI_HANDLE image, EFI_LOADED_IMAGE_PROTOCOL *li)
 				BS->FreePool(text);
 			}
 		}
+		root->Close(root);
+		root = 0;
 		handles[volumes++] = handles[i];
 	}
-	if (!volumes)
+	if (!volumes) {
+		BS->FreePool(handles);
 		return fail(EFI_NOT_FOUND, L"no EFI partitions found");
+	}
 
 	/* ask the user where RouterOS is installed */
 	for (;;) {
@@ -237,6 +243,8 @@ EFI_STATUS installer_run(EFI_HANDLE image, EFI_LOADED_IMAGE_PROTOCOL *li)
 		print(L"\r\n");
 	}
 
+	if (root)
+		root->Close(root);
 	BS->FreePool(handles);
 	print(L"efiboot: press any key to reboot\r\n");
 	wait_key();

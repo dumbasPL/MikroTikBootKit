@@ -19,8 +19,8 @@ struct SetupHeader {
 	UINT16 vid_mode;
 	UINT16 root_dev;
 	UINT16 boot_flag;
-	UINT8 jump;
-	UINT8 setup_size;
+	UINT8 jump;		/* first byte of the kernel's 2-byte short jump */
+	UINT8 jump_disp;	/* its displacement, landing past the header */
 	UINT32 header;
 	UINT16 version;
 	UINT32 realmode_swtch;

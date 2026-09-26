@@ -3,12 +3,13 @@
 
 Usage: vmconsole.py <serial-socket> "<routeros command>"
        vmconsole.py <serial-socket> --shell
-       vmconsole.py <serial-socket> --install
+       vmconsole.py <serial-socket> --install [MODE]
 
 Logs in as admin/admin (a fresh image walks a forced password change, the
 prompts are answered with "n"/admin), runs the command and prints everything
 the console sent back.  --install instead drives the bootkit installer: it
-picks the EFI partition that is not the installer's own medium, confirms and
+picks the EFI partition that is not the installer's own medium, selects the
+install mode (MODE 1 = direct, the default, 2 = removable), confirms and
 presses a key to reboot.
 """
 import re
@@ -120,11 +121,13 @@ def login(c):
     return False
 
 
-def installer(c):
-    """Drive the bootkit installer: pick the non-installer ESP, confirm the
-    install and press a key to reboot.  Returns 0 on success."""
-    if not c.expect(rb'select the target EFI partition', 60, show=True):
-        print('[no selection prompt seen]')
+def installer(c, mode='1'):
+    """Drive the bootkit installer: pick the non-installer ESP and the install
+    mode (1 direct / 2 removable), confirm and press a key to reboot.
+    Returns 0 on success."""
+    if not c.expect(rb'select the EFI partition where RouterOS is installed', 60,
+                    show=True):
+        print('[no target prompt seen]')
         return 1
     text = strip(bytes(c.buf))
     target = None
@@ -141,7 +144,12 @@ def installer(c):
         return 1
     print(f'[selecting partition {target}]')
     c.send(target.encode() + b'\r')
-    if not c.expect(rb'press any key to reboot', 120, show=True):
+    if not c.expect(rb'select mode', 60, show=True):
+        print('[no mode prompt seen]')
+        return 1
+    print(f'[selecting mode {mode}]')
+    c.send(mode.encode() + b'\r')
+    if not c.expect(rb'press any key to reboot', 180, show=True):
         print('[install did not finish]')
         return 1
     c.send(b'\r')
@@ -158,7 +166,7 @@ def main():
     c = Console(path)
     try:
         if cmd == '--install':
-            return installer(c)
+            return installer(c, sys.argv[3] if len(sys.argv) > 3 else '1')
         if cmd == '--shell':
             import threading
 

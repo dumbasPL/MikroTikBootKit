@@ -17,17 +17,22 @@
 #                               installer stick, start from a fresh varstore
 #   ./vmtest.sh install         boot stick + target, run the installer
 #   ./vmtest.sh boot            start QEMU in the background (target only)
+#   ./vmtest.sh boot-removable  boot the stick + target (stick first)
 #   ./vmtest.sh wait [SECS]     wait for the login prompt in the serial log
 #   ./vmtest.sh check           show the bootkit result lines
 #   ./vmtest.sh login           attach to the serial console (Ctrl-] to quit)
 #   ./vmtest.sh cmd "<command>" log in as admin/admin and run one command
 #   ./vmtest.sh stop            stop QEMU
 #   ./vmtest.sh test            prepare + install + boot + wait + check
+#   ./vmtest.sh test-removable  prepare + install (mode 2) + boot-removable +
+#                               wait + check
 #
 # Environment:
 #   WORK=/tmp/opencode/bkvm     scratch directory (image copy, logs, pidfile)
 #   IMG=<path>                  source image (default: x86-7.24.4-clean.img)
 #   MODE=chr|x86|keep           override the MBR mode flag (default: keep)
+#   INSTALL_MODE=1|2            installer mode for "install": 1 direct
+#                               (default), 2 removable
 #   MEM=1024  SMP=2             QEMU memory / cpus
 set -euo pipefail
 
@@ -69,6 +74,22 @@ qemu_cmd_install() {
         -device qemu-xhci,id=usb-bus \
         -device usb-storage,bus=usb-bus.0,drive=d1,serial=test \
         -device usb-storage,bus=usb-bus.0,drive=d2,serial=bk-stick \
+        -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+        -drive if=pflash,format=raw,file="$WORK/vars.fd" \
+        -display none \
+        -chardev "socket,id=ser,path=$SERIAL_SOCK,server=on,wait=off,logfile=$SERIAL_LOG" \
+        -serial chardev:ser
+}
+
+# stick + target with the stick first (bootindex), for the removable install:
+# the stick's loader reads its config and boots the kernel on the target disk
+qemu_cmd_removable() {
+    echo qemu-system-x86_64 -m "$MEM" -smp "$SMP" -cpu host -enable-kvm \
+        -drive if=none,id=d1,file="$IMG",format=raw \
+        -drive if=none,id=d2,file="$STICK",format=raw \
+        -device qemu-xhci,id=usb-bus \
+        -device usb-storage,bus=usb-bus.0,drive=d1,serial=test,bootindex=1 \
+        -device usb-storage,bus=usb-bus.0,drive=d2,serial=bk-stick,bootindex=0 \
         -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
         -drive if=pflash,format=raw,file="$WORK/vars.fd" \
         -display none \
@@ -131,7 +152,7 @@ cmd_install() {
     # shellcheck disable=SC2046
     $(qemu_cmd_install) -daemonize -pidfile "$PIDFILE"
 
-    if ! python3 "$ROOT/vmconsole.py" "$SERIAL_SOCK" --install; then
+    if ! python3 "$ROOT/vmconsole.py" "$SERIAL_SOCK" --install "${INSTALL_MODE:-1}"; then
         log "== installer failed, restoring the kernel"
         mcopy -o -i "$esp" "$WORK/kernel.bak" ::/EFI/BOOT/BOOTX64.EFI
         mdel -i "$esp" ::/EFI/BOOT/BOOTX64.BAK 2>/dev/null || true
@@ -141,7 +162,7 @@ cmd_install() {
 
     mcopy -o -i "$esp" "$WORK/kernel.bak" ::/EFI/BOOT/BOOTX64.EFI
     mdel -i "$esp" ::/EFI/BOOT/BOOTX64.BAK 2>/dev/null || true
-    log "== installed: \\EFI\\BOOT\\BOOTKIT.EFI + boot entry in vars.fd"
+    log "== installer finished (mode ${INSTALL_MODE:-1})"
 }
 
 cmd_boot() {
@@ -156,6 +177,19 @@ cmd_boot() {
     # shellcheck disable=SC2046
     $(qemu_cmd) -daemonize -pidfile "$PIDFILE"
     log "== qemu started (pid $(cat "$PIDFILE"))"
+}
+
+# removable install case: boot the stick (first) with the target attached; the
+# stick's loader follows its config and boots the kernel on the target
+cmd_boot_removable() {
+    [ -f "$IMG" ] || die "no test image, run: $0 prepare"
+    [ -f "$STICK" ] || die "no installer stick, run: $0 prepare"
+    stop_qemu
+    : > "$SERIAL_LOG"
+    rm -f "$SERIAL_SOCK"
+    # shellcheck disable=SC2046
+    $(qemu_cmd_removable) -daemonize -pidfile "$PIDFILE"
+    log "== qemu started (removable, pid $(cat "$PIDFILE"))"
 }
 
 stop_qemu() {
@@ -217,15 +251,25 @@ cmd_test() {
     cmd_check
 }
 
+cmd_test_removable() {
+    cmd_prepare
+    INSTALL_MODE=2 cmd_install
+    cmd_boot_removable
+    cmd_wait 90 || true
+    cmd_check
+}
+
 case "${1:-}" in
     prepare) shift; cmd_prepare "$@" ;;
     install) cmd_install ;;
     boot)    cmd_boot ;;
+    boot-removable) cmd_boot_removable ;;
     wait)    shift; cmd_wait "$@" ;;
     check)   cmd_check ;;
     login)   cmd_login ;;
     cmd)     shift; cmd_cmd "$@" ;;
     stop)    cmd_stop ;;
     test)    cmd_test ;;
-    *)       sed -n '2,40p' "$0"; exit 1 ;;
+    test-removable) cmd_test_removable ;;
+    *)       sed -n '2,44p' "$0"; exit 1 ;;
 esac

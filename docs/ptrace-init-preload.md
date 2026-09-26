@@ -154,10 +154,12 @@ system partition (p1 starts at LBA 0x800, so `mtools` addresses it as
 ```
 /EFI/BOOT/BOOTKIT.EFI   = bootkit EFI loader (efiboot.c -> bootkit.efi),
                           with the /ptrace_init cpio embedded; written and
-                          given its Boot#### entry by the loader's own
-                          installer (or bcfg / efibootmgr)
+                          given its Boot#### entry by the loader's installer
+                          (direct install)
 /EFI/BOOT/BOOTX64.EFI   = stock RouterOS kernel (EFI stub, ~4 MB), left in
                           place so RouterOS updates keep overwriting it
+/BOOTKIT.CFG            = target ESP identity (the partition RouterOS lives
+                          on), written by the installer
 ```
 
 The loader copies the embedded cpio below 4 GB, fills in `struct boot_params`
@@ -170,11 +172,14 @@ by it), and the stock kernel used to be renamed to `KERNEL.EFI` because the
 loader had to be `BOOTX64.EFI`.  With the loader under its own name the kernel
 file is never touched.
 
-When the loader is started as `\EFI\BOOT\BOOTX64.EFI` (from an installer
-stick) or with `--install`, it runs its installer instead of booting: it lists
-the EFI partitions it can see over the console, copies itself to
-`\EFI\BOOT\BOOTKIT.EFI` on the chosen one, creates a `MikroTikBootKit`
-`Boot####` entry at the front of `BootOrder` and reboots on a key press.
+On boot the loader reads `\BOOTKIT.CFG` next to itself.  It names the ESP
+RouterOS is installed on by the HD() device path identity (signature, start,
+size - not the bus topology); the loader finds that partition and boots
+`\EFI\BOOT\BOOTX64.EFI` from it.  Without a valid config it runs the install
+menu instead: pick the RouterOS ESP, then `direct` (copy the loader + config
+to the target, create the `Boot####` entry) or `removable` (write only
+`\BOOTKIT.CFG` next to the loader, e.g. on a USB stick, and leave the target
+untouched).  `--install` forces the menu.
 
 Booting QEMU's `-kernel BOOTX64.EFI -initrd ... -append rdinit=...` was tried
 first and does not work for this image: the wrapper runs, but the stock init
@@ -200,12 +205,15 @@ qemu-system-x86_64 -m 1024 -smp 2 -cpu host -enable-kvm \
 The one-time install run adds the installer stick as a second USB drive
 (`id=d2,serial=bk-stick`); the target's `\EFI\BOOT\BOOTX64.EFI` is moved to
 `BOOTX64.BAK` for that run only so the stick boots, and restored afterwards
-(`vmtest.sh install` does all of it).
+(`vmtest.sh install` does all of it).  For the removable boot phase both disks
+are attached with `bootindex=0` on the stick so OVMF starts it first.
 
 Rebuild loop: `./build.sh` (it re-packs `ptrace_init` and re-embeds it in
-`bootkit.efi`), `mcopy` `bootkit.efi` over `::/EFI/BOOT/BOOTKIT.EFI` (the boot
-entry and the kernel stay untouched), boot, then check the serial log for the
-`[ptrace-init]` and `[ldpreload]` lines and for `CHR Login:`.
+`bootkit.efi`), `mcopy` `bootkit.efi` over `::/EFI/BOOT/BOOTKIT.EFI` (the
+config, boot entry and kernel stay untouched), boot, then check the serial log
+for the `[ptrace-init]` and `[ldpreload]` lines and for `CHR Login:`.  To see
+the install menu again, delete `\BOOTKIT.CFG` or start the loader with
+`--install`.
 
 The paths are compile-time constants at the top of `ptrace_init.c`
 (`REAL_INIT`, `PRELOAD_PATH`); the mount strings the tracer matches
@@ -221,20 +229,23 @@ image is never touched):
 ./vmtest.sh prepare              # build, copy the image, build the installer stick
 ./vmtest.sh install              # boot stick + target and drive the installer
 ./vmtest.sh boot                 # start QEMU (background, serial on a socket)
+./vmtest.sh boot-removable       # boot stick + target (stick first)
 ./vmtest.sh wait 60              # wait for the login prompt
 ./vmtest.sh check                # show the loader + tracer + ldpreload lines
 ./vmtest.sh cmd "/system license print"   # log in (admin/admin) and run one CLI command
 ./vmtest.sh login                # attach to the serial console (Ctrl-] quits)
 ./vmtest.sh stop                 # kill the VM
 ./vmtest.sh test                 # prepare + install + boot + wait + check
+./vmtest.sh test-removable       # same, with the removable install mode
 ```
 
 Environment knobs: `IMG_SRC` (source image, default
 `x86-7.24.4-clean.img`), `WORK` (scratch dir, default `/tmp/opencode/bkvm`),
-`MODE=chr|x86|keep` (override the MBR mode flag), `MEM`, `SMP`.  `vmconsole.py`
-is the serial helper used by `vmtest.sh cmd` (logs in as admin/admin, declines
-the forced password change and runs the command) and by `vmtest.sh install`
-(`--install`: picks the non-installer ESP, confirms and reboots).
+`MODE=chr|x86|keep` (override the MBR mode flag), `INSTALL_MODE=1|2` (direct or
+removable), `MEM`, `SMP`.  `vmconsole.py` is the serial helper used by
+`vmtest.sh cmd` (logs in as admin/admin, declines the forced password change
+and runs the command) and by `vmtest.sh install` (`--install <mode>`: picks
+the non-installer ESP, picks the mode, confirms and reboots).
 
 ## 7.24.4 denies PROT_EXEC mmaps of tmpfs files - solved with a bind mount
 

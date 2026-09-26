@@ -14,12 +14,27 @@ Boot-time tooling for MikroTik RouterOS images.  Two pieces:
   expects is preserved.  Built with clang (`--target=x86_64-unknown-windows`,
   PE32+, subsystem 10), freestanding, no gnu-efi and no libc.
 
-  It is also its own installer: when it is booted as `\EFI\BOOT\BOOTX64.EFI`
-  (the removable-media fallback, i.e. from a USB stick) or with `--install` in
-  the load options, it lists the EFI partitions, asks which one to install to,
-  copies itself there as `\EFI\BOOT\BOOTKIT.EFI`, creates the `Boot####` entry
-  (first in `BootOrder`) and reboots on a key press.  That is how the kit is
-  deployed: nothing else has to write NVRAM.
+  The loader is config driven: it reads `\BOOTKIT.CFG` from the root of the
+  partition it was booted from.  The config names the ESP where RouterOS is
+  installed by its HD() device path identity (partition signature, start and
+  size - not the bus topology, so the same partition is found when the disk is
+  plugged into another port).  The loader locates that partition, reads
+  `\EFI\BOOT\BOOTX64.EFI` from it and boots it; a RouterOS update overwriting
+  that file is picked up on the next boot.
+
+  If the config is missing, unreadable or points at a partition that is not
+  there, the loader runs its install menu instead: pick the RouterOS ESP, then
+  pick a mode -
+
+  * **direct** - copy the loader to the target as `\EFI\BOOT\BOOTKIT.EFI`,
+    write `\BOOTKIT.CFG` there and create the `Boot####` entry (first in
+    `BootOrder`);
+  * **removable** - keep the loader where it is (e.g. a USB stick) and write
+    only `\BOOTKIT.CFG` next to it, pointing at the target; nothing is copied
+    and no boot entry is created.
+
+  Both end with "press any key to reboot".  `--install` in the load options
+  forces the menu even when a valid config exists.
 
 * **`ptrace_init.c`** — an alternative initramfs init (`rdinit=/ptrace_init`)
   that ptrace-attaches to the real init and waits for it to mount the tmpfs on
@@ -41,11 +56,10 @@ Design notes, the target behaviours it relies on and the observed boot log:
 
 ```
 efiboot.c                   EFI loader + installer (-> \EFI\BOOT\BOOTKIT.EFI):
-                            reads the stock kernel from \EFI\BOOT\BOOTX64.EFI,
-                            copies the embedded initramfs, fills boot_params
-                            and EFI-handover boots the kernel; as \BOOTX64.EFI
-                            or with --install it installs itself to an ESP
-                            and creates the Boot#### entry
+                            reads \BOOTKIT.CFG, finds the RouterOS ESP by its
+                            HD() identity, boots \EFI\BOOT\BOOTX64.EFI from it
+                            with the embedded initramfs; without a valid
+                            config it offers a direct/removable install menu
 ptrace_init.c               the tool (static i386)
 preload.c                   LD_PRELOAD probe: console log, in-memory key patch,
                             embedded keygen glue
@@ -99,12 +113,14 @@ Needs: KVM (`-enable-kvm` is mandatory), `clang` + `lld`, `edk2-ovmf`,
 image.  Use a *copy* of the image; the ESP (partition 1) is rewritten.  Always
 kill the VM by pidfile when done — do not leave QEMU instances running.
 
-`./vmtest.sh test` does all of the following on a copy.  `./vmtest.sh prepare`
-builds the kit, the test image and a 2 MB installer stick; `./vmtest.sh
-install` boots stick + target, drives the installer over the serial console
-and restores the target kernel; `./vmtest.sh boot` then starts the target
-normally (through the entry the installer created); `./vmtest.sh cmd "<cli
-command>"` logs into the running VM as admin/admin:
+`./vmtest.sh test` does all of the following on a copy (direct install).
+`./vmtest.sh prepare` builds the kit, the test image and a 2 MB installer
+stick; `./vmtest.sh install` boots stick + target, drives the installer over
+the serial console (`INSTALL_MODE=1` direct or `=2` removable) and restores
+the target kernel; `./vmtest.sh boot` then starts the target normally (through
+the entry the installer created) and `./vmtest.sh test-removable` /
+`boot-removable` cover the removable mode (stick first, bootindex); `./vmtest.sh
+cmd "<cli command>"` logs into the running VM as admin/admin:
 
 ```sh
 # 1. build (ptrace_init, the initramfs and the loader with it embedded)
@@ -117,23 +133,24 @@ cp ../x86-7.23.7-clean.img $IMG
 printf '\001' | dd of=$IMG bs=1 seek=$((0x150)) conv=notrunc status=none   # MBR mode flag -> CHR
 
 # 3. installer stick: a tiny FAT image with bootkit.efi as \EFI\BOOT\BOOTX64.EFI
-#    (the removable-media fallback path; the loader sees its own name and
-#    enters installer mode)
+#    (the removable-media fallback path).  With no \BOOTKIT.CFG next to it the
+#    loader starts its install menu.
 dd if=/dev/zero of=/tmp/stick.img bs=1M count=2 status=none
 mformat -i /tmp/stick.img -v BKINSTALL ::
 mmd -i /tmp/stick.img ::/EFI ::/EFI/BOOT
 mcopy -i /tmp/stick.img bootkit.efi ::/EFI/BOOT/BOOTX64.EFI
 
-# 4. run the installer: boot stick + target, pick the target from the list,
-#    the installer copies itself to \EFI\BOOT\BOOTKIT.EFI and creates the
-#    Boot#### entry, then reboots.  ./vmtest.sh install automates this (the
-#    target kernel is moved aside for the run so the stick boots).
+# 4. run the installer: boot stick + target, pick the RouterOS ESP, pick the
+#    mode (1 direct / 2 removable) and reboot.  ./vmtest.sh install automates
+#    this (the target kernel is moved aside for the run so the stick boots).
 qemu-system-x86_64 ... -drive ...file=/tmp/stick.img -device usb-storage,...d2... \
   ... -drive if=pflash,format=raw,file=/tmp/vars.fd ...
-python3 vmconsole.py /tmp/serial.sock --install
+python3 vmconsole.py /tmp/serial.sock --install 1
 
-# 5. boot the target only; the created entry starts \EFI\BOOT\BOOTKIT.EFI,
-#    which reads \EFI\BOOT\BOOTX64.EFI and the initramfs embedded in itself
+# 5. after a direct install boot the target only; the created entry starts
+#    \EFI\BOOT\BOOTKIT.EFI, which reads \BOOTKIT.CFG, finds the RouterOS ESP
+#    and boots \EFI\BOOT\BOOTX64.EFI with the embedded initramfs.  With a
+#    removable install boot stick + target (vmtest.sh boot-removable).
 grep -a BdsDxe /tmp/serial.log           # Boot000N "MikroTikBootKit" -> BOOTKIT.EFI
 grep -a efiboot /tmp/serial.log          # loader messages
 grep -a ptrace-init /tmp/serial.log      # tracer messages
@@ -146,35 +163,44 @@ kill $(cat /tmp/qemu.pid)
 
 1. Put `bootkit.efi` on a USB stick as `\EFI\BOOT\BOOTX64.EFI` (a plain FAT
    stick; no boot entry needed, the firmware's removable-media fallback finds
-   it), boot the router from it.
-2. The loader lists the EFI partitions it can see and asks where to install.
-   Pick the router's ESP; it copies itself there as `\EFI\BOOT\BOOTKIT.EFI`,
-   creates a `MikroTikBootKit` boot entry and puts it first in `BootOrder`,
-   then reboots on a key press.
+   it) and boot the router from it.
+2. The loader finds no `\BOOTKIT.CFG` and starts the install menu: pick the
+   EFI partition where RouterOS is installed, then the mode.
+   * **direct**: it copies itself to `\EFI\BOOT\BOOTKIT.EFI` there, writes
+     `\BOOTKIT.CFG` and creates a `MikroTikBootKit` `Boot####` entry first in
+     `BootOrder`.  The stick is no longer needed.
+   * **removable**: it writes `\BOOTKIT.CFG` to the stick only; nothing on the
+     router changes and no NVRAM is touched.  Keep the stick plugged in and
+     select it in the firmware boot menu (or give it a boot entry) - the
+     loader will follow the config and boot RouterOS from the internal ESP.
+3. Both modes end with "press any key to reboot".
 
 The stock kernel at `\EFI\BOOT\BOOTX64.EFI` is never touched, so a RouterOS
-update can replace it freely: the loader and its boot entry stay in place and
-the next boot loads the updated kernel with the kit's initramfs.  If an update
-also rewrites `BootOrder` (some installers re-add their own entry), just move
+update can replace it freely: the config still finds the partition, and the
+loader boots the updated kernel with the kit's initramfs.  If an update also
+rewrites `BootOrder` (some installers re-add their own entry), just move
 `MikroTikBootKit` back to the top once with `efibootmgr -o ...` or the
-firmware menu.  The installer can also be started with `--install` in the load
-options instead of the `BOOTX64.EFI` name (e.g. from the UEFI shell:
-`fs0:\EFI\BOOT\BOOTKIT.EFI --install`).
+firmware menu.  The menu can also be forced with `--install` (e.g. from the
+UEFI shell: `fs0:\EFI\BOOT\BOOTKIT.EFI --install`).
 
-Expected installer output:
+Expected installer output (direct mode):
 
 ```
+efiboot: no valid \BOOTKIT.CFG here, starting the installer
 efiboot: installer mode
 efiboot: EFI partitions:
 efiboot:   1) (no label), 32 MB
 efiboot:      PciRoot(0x0)/Pci(0x4,0x0)/USB(0x0,0x0)/HD(1,MBR,...)
 efiboot:   2) BKINSTALL, 1 MB, this installer
 efiboot:      PciRoot(0x0)/Pci(0x4,0x0)/USB(0x1,0x0)
-efiboot: select the target EFI partition [1-2] (q to cancel): 1
-efiboot: installing to partition 1
-efiboot: copied 99328 bytes
+efiboot: select the EFI partition where RouterOS is installed [1-2] (q to cancel): 1
+efiboot: installation mode:
+efiboot:   1) direct: copy the loader + config to the target and create the boot entry
+efiboot:   2) removable: keep the loader here, write only the config (target stays untouched)
+efiboot: select mode [1-2] (q to cancel): 1
 efiboot: boot entry Boot0009 -> \EFI\BOOT\BOOTKIT.EFI
-efiboot: installed; press any key to reboot
+efiboot: direct install done, copied 103424 bytes to partition 1
+efiboot: press any key to reboot
 ```
 
 Expected loader output (before the kernel takes over):
@@ -240,11 +266,18 @@ when the stored one no longer verifies).
   image boots under OVMF — the init appears to need the EFI environment.  Use
   the EFI loader above: its handover entry *is* the kernel's EFI stub, so the
   init still gets the EFI runtime environment.
-* The kit is added to the image's own ESP *by its installer* (self-copy to
-  `\EFI\BOOT\BOOTKIT.EFI` plus the `Boot####` entry).  The stock kernel stays
-  at `\EFI\BOOT\BOOTX64.EFI` (4,036,832/4,024,544 bytes depending on the
-  version) and is what `efiboot.c` reads (compile-time constant at the top of
-  the file); the initramfs is embedded in `bootkit.efi`.
+* The kit is added to the image's own ESP *by its installer*: direct mode
+  copies the loader to `\EFI\BOOT\BOOTKIT.EFI`, writes `\BOOTKIT.CFG` and
+  creates the `Boot####` entry; removable mode only writes `\BOOTKIT.CFG` on
+  the medium the loader runs from.  The stock kernel stays at
+  `\EFI\BOOT\BOOTX64.EFI` (4,036,832/4,024,544 bytes depending on the version)
+  and is what the loader boots; the initramfs is embedded in `bootkit.efi`.
+* The config is `target=mbr:<sig>:<start>:<size>` (or `gpt:` with a 32-hex
+  partition GUID), taken from the target volume's HD() device path node.  The
+  identity deliberately excludes the bus topology, so a disk moved to another
+  port still matches; a different disk does not and the menu comes up again.
+  The device path text is in a comment line for debugging (and shown in the
+  installer listing).
 * The installer writes the boot entry with the runtime services: it reuses an
   existing `Boot####` for the same file path if there is one, otherwise takes
   the next free number, and prepends it to `BootOrder`.  Variable names in

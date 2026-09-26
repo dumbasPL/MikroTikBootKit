@@ -17,6 +17,13 @@ there; a rootfs inode stays exec-mappable even when bind-mounted onto the
 tmpfs.  A failure to make any of the mounts is logged; the boot itself is
 unaffected and simply runs without the probe.
 
+Because the probe runs inside every service it is also the vehicle for the
+licence work: when loaded into `/nova/bin/mode` it runs the embedded keygen
+in-process (signing the licence blob with the custom key pair) and, like in
+`/nova/bin/keyman`, it replaces the stock licence public key in that process's
+own text before the verifier uses it.  See
+[Runtime licence: keygen + public-key patch](#runtime-licence-keygen--public-key-patch-chr).
+
 Source: `ptrace_init.c` (build: `./build.sh`).  Part of MikroTikBootKit.
 
 ## How it works
@@ -47,7 +54,9 @@ The probe (`preload.c`) is a plain i386 shared object built without libc
 against the libc already in the process (RouterOS `/lib/libc.so`).  `build.sh`
 embeds it in the init binary as a C array.  Its ELF constructor reads
 `/proc/self/exe` and writes `[ldpreload] loaded by <path> (pid=<n>)` to
-`/dev/console`.
+`/dev/console`; for `mode` and `keyman` it additionally patches the licence
+key and (for `mode`) runs the embedded keygen, see
+[Runtime licence: keygen + public-key patch](#runtime-licence-keygen--public-key-patch-chr).
 
 ## Why each piece is needed
 
@@ -277,6 +286,80 @@ before).  Serial log of a working run:
 Likely cause of the kernel behaviour: a hardening patch in the 7.24.4 kernel
 to its `mmap`/`file_operations` path (the kernels are stripped, so this was
 established behaviourally, not from source).
+
+## Runtime licence: keygen + public-key patch (CHR)
+
+The probe does more than log when it is loaded into the two licence
+components.  This is the runtime equivalent of what MikroTikPatch does to the
+NPK (patch the key material in `mode`/`keyman`, install the keygen as
+`mode`) - but nothing is written to the image; the changes live in the two
+processes and in the 512-byte licence blob.
+
+* **`/nova/bin/mode`** - the embedded keygen runs first: `preload.c`
+  `#include`s `keygen.c`, a copy of MikroTikPatch's keygen trimmed to the
+  generation role (CLI, mode2 hand-over and self test removed; no `exit()`;
+  `kg_generate()`/`kg_error()` API), and calls it in the constructor, i.e.
+  before `mode`'s `main` can read the blob.  It generates the software id if
+  needed, derives the licence value (CHR: `MT_SHA256(swapped UUID || swid)[0:8]
+  || 00 57 86 f4 03 00 00 00`), signs it with the custom private key and
+  writes the blob through `/dev/flash` / `/dev/root-disk`, exactly like the
+  keygen installed as `/nova/bin/mode` does.  `stored_licence_valid()` keeps
+  an already-installed licence, so there is no re-sign/reboot loop; the
+  constructor logs `licence generated` or `licence already installed` with the
+  System ID to `/dev/console`, and failures with `kg_error()`.  (The copy is
+  deliberately not merged back: MikroTikPatch keeps the standalone CLI and the
+  device role.)
+* **`/nova/bin/mode` and `/nova/bin/keyman`** - the stock licence public key
+  is replaced in the process's own text.  On i386 the key is not stored as a
+  byte string: the verifier builds it on the stack with eight
+  `mov dword [ebp-x], imm32` instructions, so the 4-byte key chunks sit in
+  `.text` with up to 6 opcode bytes between them (`7.23.7 mode` at file
+  offset `0x5e23`, `keyman` at `0x765e`; the 7.24.4 binaries are identical).
+  The probe scans the executable's `r-xp` mapping from `/proc/self/maps`,
+  matches the chunks with the same greedy gap search as MikroTikPatch's
+  `ReplaceKeyArch()` and rewrites the chunks in place, leaving the
+  instruction bytes alone.  Only the private (COW) mapping is written.
+
+The pages are made writable for the patch.  7.24.4 rejects
+`mprotect(PROT_READ|PROT_WRITE|PROT_EXEC)` (its W^X hardening), so the probe
+asks for `rw` and restores `r-x` afterwards; the first 7.24.4 run showed
+`licence key patched (0 site)` until that was fixed.
+
+The key pair and the stock key come from `keys.env` at build time (the
+repo-local one when present, otherwise MikroTikPatch's;
+`CUSTOM_LICENSE_PUBLIC_KEY`/`CUSTOM_LICENSE_PRIVATE_KEY`,
+`MIKRO_LICENSE_PUBLIC_KEY`), so the signature the keygen makes verifies
+against the key the probe patches in.
+
+Verified on CHR-mode x86 installs (`MODE=chr`), 7.23.7 and 7.24.4, first boot
+and reboot (the blob persists in sector 0):
+
+```
+[ldpreload] loaded by /nova/bin/mode (pid=129)
+[ldpreload] mode: licence key patched (1 site)
+[ldpreload] mode: licence generated (system-id d7qGpgIOFXP)
+[ldpreload] loaded by /nova/bin/keyman (pid=135)
+[ldpreload] keyman: licence key patched (1 site)
+
+[admin@CHR] > /system license print
+         system-id: d7qGpgIOFXP
+             level: p-unlimited
+
+# after the reboot:
+[ldpreload] mode: licence already installed (system-id d7qGpgIOFXP)
+```
+
+Notes on scope:
+
+* The **loader is deliberately not patched.**  It has its own copy of the key
+  and verifies the blob at boot, but RouterOS cross-checks the loader's key
+  against other state; changing it aborts the supervisor (`/nova/bin/sys2`),
+  and in CHR mode the loader gate does not require a valid signature anyway
+  (the runtime `mode` daemon is the one that raises the level).
+* **x86 (non-CHR) mode is not attempted yet** - it binds the licence to the
+  hardware id and has extra checks.  The embedded keygen still contains the
+  x86 path; it is just untested.  On CHR the licence is bound to the VM UUID
+  and the software id only.
 
 ## Notes
 

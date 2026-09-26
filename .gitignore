@@ -3,3 +3,4 @@
 /preload_so.h
 *.img
 *.iso
+/keys.env

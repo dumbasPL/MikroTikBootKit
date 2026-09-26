@@ -32,9 +32,32 @@ fi
 # 1. the LD_PRELOAD probe (preload.c): ordinary C built without libc, so its
 #    imports (open/write/readlink/getpid/snprintf/...) are resolved at load
 #    time by the dynamic linker against the process's libc.
+#
+#    The probe carries the embedded keygen (keygen.c, included by preload.c)
+#    and patches the licence public key in mode/keyman, to the key pair in
+#    keys.env: $ROOT/keys.env when present, otherwise MikroTikPatch's next to
+#    this repo.  The key pair can be overridden with
+#    CUSTOM_LICENSE_PUBLIC_KEY / CUSTOM_LICENSE_PRIVATE_KEY, the stock key
+#    with MIKRO_LICENSE_PUBLIC_KEY; when nothing is set the defaults baked
+#    into keygen.c / preload.c are used.
+KEYS_ENV=${KEYS_ENV:-$ROOT/keys.env}
+[ -f "$KEYS_ENV" ] || KEYS_ENV=$ROOT/../MikroTikPatch/keys.env
+if [ -f "$KEYS_ENV" ]; then
+    [ -n "${CUSTOM_LICENSE_PUBLIC_KEY:-}" ] || CUSTOM_LICENSE_PUBLIC_KEY=$(sed -n 's/^CUSTOM_LICENSE_PUBLIC_KEY=//p' "$KEYS_ENV" | head -n1)
+    [ -n "${CUSTOM_LICENSE_PRIVATE_KEY:-}" ] || CUSTOM_LICENSE_PRIVATE_KEY=$(sed -n 's/^CUSTOM_LICENSE_PRIVATE_KEY=//p' "$KEYS_ENV" | head -n1)
+    [ -n "${MIKRO_LICENSE_PUBLIC_KEY:-}" ] || MIKRO_LICENSE_PUBLIC_KEY=$(sed -n 's/^MIKRO_LICENSE_PUBLIC_KEY=//p' "$KEYS_ENV" | head -n1)
+fi
+
+DEFS=""
+[ -n "${CUSTOM_LICENSE_PUBLIC_KEY:-}" ] && DEFS="$DEFS -DKEYGEN_LICENSE_PUBLIC_HEX=\"$CUSTOM_LICENSE_PUBLIC_KEY\""
+[ -n "${CUSTOM_LICENSE_PRIVATE_KEY:-}" ] && DEFS="$DEFS -DKEYGEN_LICENSE_PRIVATE_HEX=\"$CUSTOM_LICENSE_PRIVATE_KEY\""
+[ -n "${MIKRO_LICENSE_PUBLIC_KEY:-}" ] && DEFS="$DEFS -DSTOCK_LICENSE_PUBLIC_HEX=\"$MIKRO_LICENSE_PUBLIC_KEY\""
+echo "== probe keys: custom ${CUSTOM_LICENSE_PUBLIC_KEY:-<keygen.c default>}, stock ${MIKRO_LICENSE_PUBLIC_KEY:-<built-in default>}"
+
 # shellcheck disable=SC2086
-$CC -shared -fPIC -nostdlib -Os -fno-stack-protector \
-    -o "$ROOT/preload.so" "$ROOT/preload.c"
+$CC -shared -fPIC -nostdlib -Os -fno-stack-protector -fvisibility=hidden \
+    -ffunction-sections -fdata-sections -Wl,--gc-sections \
+    $DEFS -o "$ROOT/preload.so" "$ROOT/preload.c"
 
 # 2. embed preload.so into the init binary
 python3 - "$ROOT/preload.so" "$ROOT/preload_so.h" <<'PY'

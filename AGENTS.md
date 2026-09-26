@@ -9,7 +9,11 @@ Boot-time tooling for MikroTik RouterOS images.  Currently one tool:
   The probe is put into the environment before `/init` is exec'd, so every
   dynamically linked binary started after the mount (`sysinit`, `mode`,
   `loader`, all services) loads it and its constructor logs the binary's name
-  to `/dev/console`.  Nothing in the RouterOS image is modified.
+  to `/dev/console`.  On top of the logging the probe carries the embedded
+  keygen (`keygen.c`, adapted from MikroTikPatch's): in `/nova/bin/mode` it
+  signs and installs the licence with the custom key pair, and in `mode` and
+  `keyman` it replaces the licence public key the stock verifier builds on its
+  stack.  Nothing in the RouterOS image is modified on disk.
 
 Design notes, the target behaviours it relies on and the observed boot log:
 `docs/ptrace-init-preload.md`.
@@ -18,7 +22,9 @@ Design notes, the target behaviours it relies on and the observed boot log:
 
 ```
 ptrace_init.c               the tool (static i386)
-preload.c                   LD_PRELOAD probe (normal C, imports resolved by the ldso)
+preload.c                   LD_PRELOAD probe: console log, in-memory key patch,
+                            embedded keygen glue
+keygen.c                    embeddable licence keygen (adapted from MikroTikPatch)
 build.sh                    builds + embeds the probe, then the tool
 vmtest.sh                   prepare/boot/interact with a test image copy
 vmconsole.py                serial-console helper used by vmtest.sh cmd
@@ -28,12 +34,21 @@ docs/ptrace-init-preload.md design + findings + verified log
 ## Build
 
 ```sh
-./build.sh                  # -> ./ptrace_init (static i386, ~73 KB with the probe)
+./build.sh                  # -> ./ptrace_init (static i386, ~90 KB with the probe)
 ```
 
 The LD_PRELOAD probe (preload.c) is ordinary C linked without libc
 (-nostdlib): no DT_NEEDED entry, the imports are bound at load time by the
 dynamic linker against the libc already in the process (RouterOS /lib/libc.so).
+
+The licence tooling is built in: `keygen.c` is a copy of MikroTikPatch's
+keygen trimmed to the generation role (no CLI, no mode2 hand-over, no
+`exit()`, clean `kg_generate()`/`kg_error()` API) and is `#include`d by
+`preload.c`.  The key material is baked in at build time from `keys.env`
+(`$ROOT/keys.env` when present, otherwise `MikroTikPatch/keys.env`):
+`CUSTOM_LICENSE_PUBLIC_KEY` / `CUSTOM_LICENSE_PRIVATE_KEY`, stock key
+`MIKRO_LICENSE_PUBLIC_KEY`; both are overridable via environment / `KEYS_ENV`,
+and `/keys.env` is gitignored.
 
 It uses, in order: a local `.toolchain/i386-musl`, MikroTikPatch's
 `.toolchain/i386-musl` (create it with `MikroTikPatch/tools/musl_i386.sh`), or
@@ -95,17 +110,36 @@ Expected tracer output:
 [ptrace-init] bind-mounted /proc/self/fd/N -> /ram/ldpreload.so, detaching
 [ldpreload] loaded by /sbin/sysinit (pid=119)
 [ldpreload] loaded by /nova/bin/mode (pid=129)
+[ldpreload] mode: licence key patched (1 site)
+[ldpreload] mode: licence generated (system-id xxxxxxxxxxx)
+[ldpreload] loaded by /nova/bin/keyman (pid=135)
+[ldpreload] keyman: licence key patched (1 site)
 [ldpreload] loaded by /nova/bin/loader (pid=130)
 ... (47 loads in total)
 ```
+
+On a CHR-mode boot `/system license print` then shows `level: p-unlimited`
+with that `system-id`; the blob is written to sector 0 of the disk, so later
+boots log `licence already installed` and keep it (the keygen only re-signs
+when the stored one no longer verifies).
 
 ### Notes / gotchas
 
 * **Known versions:** works on 7.23.7 and 7.24.4 (both x86 and CHR mode,
   40-47 loads, boot reaches the login prompt).  On 7.24.4 the kernel refuses
   `PROT_EXEC` mappings of tmpfs files, so the probe is not written to `/ram`
-  but bind-mounted there from a copy kept on the initramfs.  Details:
+  but bind-mounted there from a copy kept on the initramfs; the same kernel
+  also rejects `mprotect(PROT_READ|PROT_WRITE|PROT_EXEC)`, so the in-memory
+  key patch makes the text pages `rw` and restores `r-x` afterwards.  Details:
   `docs/ptrace-init-preload.md`.
+* **The loader is never touched.**  It also verifies licences, but RouterOS
+  cross-checks its embedded key against other state at boot and a modified
+  loader aborts the system supervisor (`/nova/bin/sys2`); the CHR boot gate
+  does not need its key patched.  The probe only patches `mode` and `keyman`.
+* **The licence check is CHR-tested only.**  On CHR the licence is bound to
+  the VM UUID plus the software id; x86 mode has extra hardware checks and is
+  not attempted yet (the embedded keygen still contains the x86 path, it is
+  just unverified).
 * **Do not boot with QEMU's `-kernel` + `-initrd`.**  It was tried: the
   wrapper runs, but the stock init then fails (`opendir: No such file or
   directory` → `ERROR: no system package found!`) and the kernel panics.  The

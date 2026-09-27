@@ -299,7 +299,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             "gcc-$(gcc -dumpversion)-multilib" libc6-dev-i386 \
             clang lld gcc-arm-linux-gnueabihf \
-            qemu-system-arm qemu-efi-aarch64 mtools cpio unzip
+            qemu-system-arm qemu-efi-aarch64 ipxe-qemu mtools cpio unzip
 
       - name: Cache the arm musl toolchain
         uses: actions/cache@v4

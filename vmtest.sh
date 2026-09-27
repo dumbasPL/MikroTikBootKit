@@ -136,7 +136,9 @@ if [ "$ARCH" = arm64 ]; then
     # arm64 UEFI firmware: AAVMF_CODE/AAVMF_VARS override; otherwise the first
     # pair that exists.  QEMU's virt pflash banks are 64 MiB, so only a
     # matching code/vars pair works (Ubuntu also ships a compact 2 MiB
-    # QEMU_EFI.fd used by some setups; it is not listed on purpose).
+    # QEMU_EFI.fd used by some setups; it is not listed on purpose).  The
+    # sizes are read through symlinks - Ubuntu's AAVMF_CODE.fd is a link to
+    # AAVMF_CODE.no-secboot.fd, so stat -L is what makes the pair match there.
     if [ -z "${AAVMF_CODE:-}" ] || [ -z "${AAVMF_VARS:-}" ]; then
         for pair in \
             /usr/share/edk2/aarch64/QEMU_EFI.fd:/usr/share/edk2/aarch64/QEMU_VARS.fd \
@@ -144,7 +146,7 @@ if [ "$ARCH" = arm64 ]; then
             /usr/share/qemu-efi-aarch64/QEMU_EFI.fd:/usr/share/qemu-efi-aarch64/QEMU_VARS.fd; do
             code=${pair%%:*}; vars=${pair##*:}
             if [ -f "$code" ] && [ -f "$vars" ] &&
-               [ "$(stat -c %s "$code")" = "$(stat -c %s "$vars")" ]; then
+               [ "$(stat -Lc %s "$code")" = "$(stat -Lc %s "$vars")" ]; then
                 AAVMF_CODE=${AAVMF_CODE:-$code}
                 AAVMF_VARS=${AAVMF_VARS:-$vars}
                 break
@@ -152,7 +154,7 @@ if [ "$ARCH" = arm64 ]; then
         done
     fi
     [ -f "${AAVMF_CODE:-}" ] && [ -f "${AAVMF_VARS:-}" ] &&
-        [ "$(stat -c %s "${AAVMF_CODE:-/dev/null}")" = "$(stat -c %s "${AAVMF_VARS:-/dev/null}")" ] ||
+        [ "$(stat -Lc %s "${AAVMF_CODE:-/dev/null}")" = "$(stat -Lc %s "${AAVMF_VARS:-/dev/null}")" ] ||
         die "arm64 UEFI firmware not found; set AAVMF_CODE and AAVMF_VARS (same size)"
     FW_CODE=$AAVMF_CODE
     FW_VARS=$AAVMF_VARS

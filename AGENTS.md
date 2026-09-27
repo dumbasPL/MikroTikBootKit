@@ -253,11 +253,13 @@ For the **arm64 CHR** set `ARCH=arm64` and point `IMG_SRC` at the stock
 `chr-<ver>-arm64.img.zip` (or an extracted `.img`; `vmtest.sh` unpacks a zip
 itself).  That needs `qemu-system-aarch64` (Ubuntu: `qemu-system-arm`), the
 matched 64 MiB AAVMF pair (Ubuntu: `qemu-efi-aarch64`; Arch: `edk2-aarch64`;
-`AAVMF_CODE`/`AAVMF_VARS` override) and a host `arm-linux-gnueabihf-gcc` for
-the arm32 probe.  The arm64 run always uses TCG with `-cpu cortex-a72` (the
-CHR arm64 kernel hangs with `-cpu max`) and boots to `CHR Login:` on
-`ttyAMA0`.  Note that `/system check-installation` fails on arm64 CHR under
-QEMU by itself (the empty-DTB capability-file check), independent of the kit.
+`AAVMF_CODE`/`AAVMF_VARS` override), `ipxe-qemu` on Debian/Ubuntu (the `virt`
+machine's default virtio NIC loads `efi-virtio.rom` from it) and a host
+`arm-linux-gnueabihf-gcc` for the arm32 probe.  The arm64 run always uses TCG
+with `-cpu cortex-a72` (the CHR arm64 kernel hangs with `-cpu max`) and boots
+to `CHR Login:` on `ttyAMA0`.  Note that `/system check-installation` fails on
+arm64 CHR under QEMU by itself (the empty-DTB capability-file check),
+independent of the kit.
 
 `./vmtest.sh test` does all of the following on a copy (direct install).
 `./vmtest.sh prepare` builds the kit, the test image and copies the arch's

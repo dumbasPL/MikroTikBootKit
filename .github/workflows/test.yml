@@ -196,7 +196,6 @@ jobs:
         run: |
           set -euo pipefail
           ./vmtest.sh test
-          cp .work/serial.log serial-direct.log
           grep -aq 'efiboot:' .work/serial.log
           grep -aq 'ptrace-init' .work/serial.log
           grep -aq 'ldpreload. loaded by' .work/serial.log
@@ -214,7 +213,6 @@ jobs:
             chr) grep -aq 'level: p-unlimited' license-direct.txt ;;
             x86) ! grep -aq 'expires-in' license-direct.txt ;;
           esac
-          cp .work/serial.log serial-direct-login.log
 
       - name: Test the removable install
         env:
@@ -224,7 +222,6 @@ jobs:
         run: |
           set -euo pipefail
           ./vmtest.sh test-removable
-          cp .work/serial.log serial-removable.log
           grep -aq 'ptrace-init' .work/serial.log
           grep -aq 'ldpreload. loaded by' .work/serial.log
           [ "$(grep -ac 'ldpreload. loaded by' .work/serial.log)" -ge 5 ]
@@ -236,7 +233,6 @@ jobs:
             chr) grep -aq 'level: p-unlimited' license-removable.txt ;;
             x86) ! grep -aq 'expires-in' license-removable.txt ;;
           esac
-          cp .work/serial.log serial-removable-login.log
 
       - name: Test the auto stick
         env:
@@ -246,7 +242,6 @@ jobs:
         run: |
           set -euo pipefail
           ./vmtest.sh test-auto
-          cp .work/serial.log serial-auto.log
           grep -aq 'efiboot: auto mode: looking for the first RouterOS kernel' .work/serial.log
           grep -aq 'efiboot: auto: kernel found on' .work/serial.log
           grep -aq 'ptrace-init' .work/serial.log
@@ -262,18 +257,6 @@ jobs:
             chr) grep -aq 'level: p-unlimited' license-auto.txt ;;
             x86) ! grep -aq 'expires-in' license-auto.txt ;;
           esac
-          cp .work/serial.log serial-auto-login.log
-
-      - name: Upload the serial logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: vmtest-${{ matrix.mode }}
-          path: |
-            serial-*.log
-            license-*.txt
-          if-no-files-found: ignore
-          retention-days: 14
 
   vmtest-arm64:
     name: arm64 (RouterOS ${{ needs.version.outputs.version }})
@@ -333,7 +316,6 @@ jobs:
         run: |
           set -euo pipefail
           ./vmtest.sh test
-          cp .work/serial.log serial-direct.log
           grep -aq 'efiboot:' .work/serial.log
           grep -aq 'ptrace-init' .work/serial.log
           grep -aq 'ldpreload. loaded by' .work/serial.log
@@ -350,13 +332,11 @@ jobs:
           grep -aqE 'system-id' license-direct.txt
           grep -aq 'level: p-unlimited' license-direct.txt
           ! grep -aq 'expires-in' license-direct.txt
-          cp .work/serial.log serial-direct-login.log
 
       - name: Test the removable install
         run: |
           set -euo pipefail
           ./vmtest.sh test-removable
-          cp .work/serial.log serial-removable.log
           grep -aq 'ptrace-init' .work/serial.log
           grep -aq 'ldpreload. loaded by' .work/serial.log
           [ "$(grep -ac 'ldpreload. loaded by' .work/serial.log)" -ge 5 ]
@@ -365,13 +345,11 @@ jobs:
           ./vmtest.sh stop
           grep -aqE 'system-id' license-removable.txt
           grep -aq 'level: p-unlimited' license-removable.txt
-          cp .work/serial.log serial-removable-login.log
 
       - name: Test the auto stick
         run: |
           set -euo pipefail
           ./vmtest.sh test-auto
-          cp .work/serial.log serial-auto.log
           grep -aq 'efiboot: auto mode: looking for the first RouterOS kernel' .work/serial.log
           grep -aq 'efiboot: auto: kernel found on' .work/serial.log
           grep -aq 'ptrace-init' .work/serial.log
@@ -385,15 +363,3 @@ jobs:
           grep -aqE 'system-id' license-auto.txt
           grep -aq 'level: p-unlimited' license-auto.txt
           ! grep -aq 'expires-in' license-auto.txt
-          cp .work/serial.log serial-auto-login.log
-
-      - name: Upload the serial logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: vmtest-arm64
-          path: |
-            serial-*.log
-            license-*.txt
-          if-no-files-found: ignore
-          retention-days: 14

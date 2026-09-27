@@ -348,7 +348,7 @@ license print"` works on a stock image too.
 x86 job, plus an arm64 job on the stock CHR `*.img.zip`: it caches the
 i386/arm musl toolchains and the installer ISO / CHR image, installs the clean
 image once per job and then runs the direct and the removable test with
-loader/tracer/probe and licence assertions (and uploads the serial logs).
+loader/tracer/probe and licence assertions.
 GitHub-hosted runners have no usable KVM, so the workflow probes it and falls
 back to `ACCEL=tcg` with a longer `WAIT`.  The RouterOS version is resolved
 first from `upgrade.mikrotik.com` (`NEWESTa7.<channel>`, the endpoint the

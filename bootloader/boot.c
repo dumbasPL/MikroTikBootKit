@@ -7,7 +7,13 @@
 #include "efi.h"
 #include "bootabi.h"
 #include "boot.h"
-#include "initrd_so.h"
+/* the embedded initramfs (build.sh writes the x86 one as initrd_so.h and the
+ * arm64 one as initrd_so_arm.h; each loader is built with the matching
+ * -DINITRD_SO_HEADER) */
+#ifndef INITRD_SO_HEADER
+#define INITRD_SO_HEADER "initrd_so.h"
+#endif
+#include INITRD_SO_HEADER
 
 /* compile-time configuration; the serial console and the verbose tracer/probe
  * logs are enabled by "debug=1" in \BOOTKIT.CFG (default BOOTKIT_DEBUG_DEFAULT,

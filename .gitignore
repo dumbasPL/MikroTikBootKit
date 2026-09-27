@@ -1,10 +1,17 @@
 /ptrace_init
+/ptrace_init-arm
 /bootkit.efi
+/bootkit-arm64.efi
 /bootkit.img
+/bootkit-arm64.img
 /initrd.cpio
+/initrd-arm.cpio
 /bootkit/preload.so
+/bootkit/preload-arm.so
 /bootkit/preload_so.h
+/bootkit/preload_so_arm.h
 /bootloader/initrd_so.h
+/bootloader/initrd_so_arm.h
 *.img
 *.iso
 /.toolchain/

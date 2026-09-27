@@ -30,7 +30,16 @@ typedef void			VOID;
 #define BOOTKIT_DEBUG_DEFAULT 0
 #endif
 
+/*
+ * The UEFI calling convention.  x86_64 UEFI uses the Microsoft ABI, so the
+ * freestanding Windows target gets ms_abi; AArch64 UEFI uses the standard
+ * AAPCS64 (edk2's Base.h defines EFIAPI empty there too).
+ */
+#if defined(__x86_64__) || defined(_M_X64)
 #define EFIAPI __attribute__((ms_abi))
+#else
+#define EFIAPI
+#endif
 #define EFI_PAGE_SIZE 4096
 #define EFI_SIZE_TO_PAGES(n) (((n) + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE)
 
@@ -56,6 +65,9 @@ typedef UINTN EFI_TPL;
 #define EFI_FILE_MODE_WRITE	0x0000000000000002ULL
 #define EFI_FILE_MODE_CREATE	0x8000000000000000ULL
 #define EFI_FILE_DIRECTORY	0x0000000000000010ULL
+#define EFI_FILE_PROTOCOL_REVISION 0x00010000
+#define EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_REVISION 0x00010000
+#define EFI_NATIVE_INTERFACE	0
 
 #define EFI_VARIABLE_NON_VOLATILE	0x00000001
 #define EFI_VARIABLE_BOOTSERVICE_ACCESS	0x00000002
@@ -142,6 +154,10 @@ struct EFI_RUNTIME_SERVICES {
 };
 
 typedef struct EFI_BOOT_SERVICES EFI_BOOT_SERVICES;
+
+/* defined further down; LoadImage/StartImage need the name here */
+typedef struct EFI_DEVICE_PATH_PROTOCOL EFI_DEVICE_PATH_PROTOCOL;
+
 struct EFI_BOOT_SERVICES {
 	EFI_TABLE_HEADER Hdr;
 	EFI_TPL (EFIAPI *RaiseTPL)(EFI_TPL);
@@ -158,20 +174,21 @@ struct EFI_BOOT_SERVICES {
 	VOID *SignalEvent;
 	VOID *CloseEvent;
 	VOID *CheckEvent;
-	VOID *InstallProtocolInterface;
+	EFI_STATUS (EFIAPI *InstallProtocolInterface)(EFI_HANDLE *, EFI_GUID *, UINTN, VOID *);
 	VOID *ReinstallProtocolInterface;
-	VOID *UninstallProtocolInterface;
+	EFI_STATUS (EFIAPI *UninstallProtocolInterface)(EFI_HANDLE, EFI_GUID *, VOID *);
 	EFI_STATUS (EFIAPI *HandleProtocol)(EFI_HANDLE, EFI_GUID *, VOID **);
 	VOID *Reserved;
 	VOID *RegisterProtocolNotify;
 	VOID *LocateHandle;
 	VOID *LocateDevicePath;
 	VOID *InstallConfigurationTable;
-	VOID *LoadImage;
-	VOID *StartImage;
-	VOID *Exit;
+	EFI_STATUS (EFIAPI *LoadImage)(BOOLEAN, EFI_HANDLE, EFI_DEVICE_PATH_PROTOCOL *,
+				       VOID *, UINTN, EFI_HANDLE *);
+	EFI_STATUS (EFIAPI *StartImage)(EFI_HANDLE, UINTN *, CHAR16 **);
+	EFI_STATUS (EFIAPI *Exit)(EFI_HANDLE, EFI_STATUS, UINTN, CHAR16 *);
 	VOID *UnloadImage;
-	VOID *ExitBootServices;
+	EFI_STATUS (EFIAPI *ExitBootServices)(EFI_HANDLE, UINTN);
 	VOID *GetNextMonotonicCount;
 	EFI_STATUS (EFIAPI *Stall)(UINTN);
 	VOID *SetWatchdogTimer;
@@ -284,11 +301,11 @@ typedef struct {
 	CHAR16 VolumeLabel[1];
 } EFI_FILE_SYSTEM_INFO;
 
-typedef struct {
+struct EFI_DEVICE_PATH_PROTOCOL {
 	UINT8 Type;
 	UINT8 SubType;
 	UINT8 Length[2];
-} __attribute__((packed)) EFI_DEVICE_PATH_PROTOCOL;
+} __attribute__((packed));
 
 typedef struct {
 	EFI_DEVICE_PATH_PROTOCOL Header;

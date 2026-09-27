@@ -1,7 +1,9 @@
 #ifndef EFIBOOT_BOOT_H
 #define EFIBOOT_BOOT_H
 
-/* boot.h - load the kernel from an ESP and enter it via EFI handover. */
+/* boot.h - load the stock kernel from an ESP and enter it: boot.c is the
+ * x86_64 EFI handover implementation, boot_arm64.c the AArch64
+ * LoadImage/StartImage one. */
 
 #include "efi.h"
 

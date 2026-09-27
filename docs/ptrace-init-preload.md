@@ -388,6 +388,8 @@ image; the changes live in those processes and in the 512-byte licence blob.
   matches the chunks with the same greedy gap search as the reference key
   patcher and rewrites the chunks in place, leaving the
   instruction bytes alone.  Only the private (COW) mapping is written.
+  On **arm32** (see below) the same scan works on the pool words, and the
+  derived word is patched by rewriting the add sequence.
 * **`/nova/bin/loader`** - its `memcmp` GOT slot is redirected to a stub that
   always returns 0.  The loader's licence verifier ends in
   `memcmp(MT_SHA256(y.x), witness, 16) == 0`, so the redirect makes it accept
@@ -436,6 +438,97 @@ Notes on scope:
   aborts the supervisor (`/nova/bin/sys2`).  Its `memcmp` GOT slot is
   redirected instead (see above), which makes its verifier accept the custom
   signature without touching any text or key bytes.
+
+## The arm64 CHR (AArch32 userspace)
+
+The arm64 CHR image is booted by a second, AArch64 EFI loader
+(`bootloader/boot_arm64.c`, `bootkit-arm64.efi`).  The arch-specific parts:
+
+* The stock kernel at `\EFI\BOOT\BOOTAA64.EFI` is a PE/COFF EFI application,
+  so the loader starts it with `LoadImage`/`StartImage` (keeping the EFI
+  runtime environment), passing its command line through the loaded image's
+  `LoadOptions`.
+* The 5.6 stub has no LoadFile2 initrd support and the boot is ACPI (the stub
+  prints `Generating empty DTB`), so the initramfs cannot be handed over
+  through the DT.  The stub does support `initrd=<file>`: it opens the file on
+  the kernel image's own device handle.  The loader installs a one-file RAM
+  volume (`bootloader/initrdvol.c`) and points the loaded image's
+  `DeviceHandle` at it, so nothing is written to disk.
+* The stock initramfs (stage-1 `/init`, `/dev/console`, `/dev/ram0`) is an XZ
+  stream inside the kernel's `.data` section, and a kernel-supplied initrd
+  replaces it.  The loader therefore finds that stream (XZ magic plus the
+  header/footer CRC32 checks) and passes `[stock stream][zero pad][kit cpio]`
+  as one initrd; Linux's unpacker accepts concatenated archives and detects
+  the compression of each segment.  The kit's cpio then adds `/ptrace_init`
+  next to the stock files.
+
+The userspace of the arm64 CHR is **AArch32** (armv7-A, EABI5, soft-float):
+`/nova/bin/mode`, `keyman`, `loader` and `libc.so` are 32-bit ARM ELF.  The
+kit is therefore built for arm32 as well (`tools/musl_arm.sh`,
+`.toolchain/arm-musl`): `ptrace_init` is a static arm32 musl binary (the
+tracer runs next to the arm32 `/init`; `SYS_mount` is 21 and
+`PTRACE_PEEKDATA` reads 32-bit words, so the tracer code is unchanged), and
+the probe is an armv7 soft-float shared object (`-mfloat-abi=soft
+-nostdlib`) so the soft-float RouterOS `libc.so` can preload it.
+
+The licence key material is encoded differently in the arm32 builds.  The
+verifier (the same function in `mode`, `keyman` and `loader`) builds the
+32-byte key on the stack from a **literal pool of seven words** in `.text`
+(in the order chunk 4, 5, 2, 0, 1, 6, 7) and materialises the fourth word
+with three `add rX, rX, #imm` instructions (chunk2 + `0x1E4FD640`).  The x86
+chunk scan finds only seven of the eight words, so the arm32 patcher:
+
+1. finds the 28-byte pool pattern in the executable mapping,
+2. locates the surrounding 7-instruction block
+   (`add; strd r0,r1,[sp]; add; ldr r0,[pc]->pool+0x14; add;
+   ldr r1,[pc]->pool+0x18; str rX,[sp,#0xc]`) and verifies the two `ldr`
+   targets point into the pool (that ties the block to the pattern),
+3. rewrites the first add to `movw rX, #lo16(new word)`, the second to
+   `movt rX, #hi16(new word)` and the third to a nop, and
+4. patches the seven pool words in place.
+
+This was verified on the 7.23.7 and 7.24.4 `mode`/`keyman` (and the identical
+block in `loader`) before it was written in C; it does not depend on the old
+immediates, so any custom key works.
+
+The `memcmp` GOT redirect needs no changes: the arm32 `loader` uses ELF32
+`R_ARM_JUMP_SLOT` relocations in `.rel.plt` (`DT_REL`/`DT_JMPREL`), exactly
+the tables the existing ELF32 code walks.
+
+Verified arm64 CHR boot log (QEMU `-M virt -cpu cortex-a72`, AAVMF, stock
+`chr-7.24.4-arm64.img`), `debug=1`:
+
+```
+BdsDxe: loading Boot0004 "MikroTikBootKit" ... /\EFI\BOOT\BOOTKIT.EFI
+BdsDxe: starting Boot0004 "MikroTikBootKit" ...
+efiboot: MikroTik boot kit loader
+efiboot: initrd 171120 bytes (stock 81008 + kit 90112), booting (rdinit=/ptrace_init initrd=initrd.cpio console=ttyAMA0,115200n8 bootkit_debug=1)
+EFI stub: Booting Linux Kernel...
+EFI stub: Generating empty DTB
+EFI stub: Exiting boot services and installing virtual address map...
+[ptrace-init] tracing pid 1
+[ptrace-init] exec /init (LD_PRELOAD=/ram/ldpreload.so)
+[ptrace-init] following the init into /newroot
+[ptrace-init] pid 1 mounts tmpfs on /ram
+[ptrace-init] bind-mounted /proc/self/fd/3 -> /ram/ldpreload.so, detaching
+[ldpreload] loaded by /sbin/sysinit (pid=112)
+...
+[ldpreload] loaded by /nova/bin/mode (pid=122)
+[ldpreload] mode: licence key patched (1 site)
+[ldpreload] mode: licence generated (system-id fh0pV1dV81M)
+[ldpreload] loaded by /nova/bin/keyman (pid=152)
+[ldpreload] keyman: licence key patched (1 site)
+[ldpreload] loaded by /nova/bin/loader (pid=124)
+[ldpreload] loader: memcmp GOT patched (1 slot)
+...
+CHR Login:
+
+[admin@CHR] > /system license print
+         system-id: fh0pV1dV81M
+             level: p-unlimited
+  limited-upgrades: no
+```
+
 * **x86 (non-CHR) mode works too** - tested on the 7.23.7 and 7.24.4 x86
   installs.  The keygen writes a freshly generated software id out first
   (keyman re-reads the blob for `--software-id`), takes the serial from

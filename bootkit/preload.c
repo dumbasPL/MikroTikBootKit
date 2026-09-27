@@ -30,12 +30,19 @@
  *   everything else   nothing (debug=1: only the console line)
  *
  * The in-memory patch is the runtime equivalent of the key replacement the
- * reference patch does to the binaries: the x86 binaries store the 32-byte public key as eight
- * `mov dword [ebp-x], imm32` immediates in .text (up to 6 bytes between the
- * 4-byte chunks).  The chunks are replaced in place and the bytes of the
- * instructions in between are left alone.  The affected pages are made
- * writable for the patch and restored to r-x afterwards; only the private
- * (COW) text mapping is touched, so the file on disk is untouched.
+ * reference patch does to the binaries.  The encoding differs per arch:
+ *
+ *   x86        the 32-byte public key is eight `mov dword [ebp-x], imm32`
+ *              immediates in .text (up to 6 bytes between the 4-byte chunks)
+ *   arm32      seven words sit in a .text literal pool (order 4,5,2,0,1,6,7)
+ *              and the fourth is computed from the third with three `add`
+ *              immediates; the pool and the add sequence are rewritten (the
+ *              arm64 CHR's userspace is AArch32, built as armv7 soft-float)
+ *
+ * The chunks are replaced in place and the bytes of the instructions in
+ * between are left alone.  The affected pages are made writable for the
+ * patch and restored to r-x afterwards; only the private (COW) text mapping
+ * is touched, so the file on disk is untouched.
  *
  * The key pair is hard-coded in keygen.c and can be overridden at build time
  * (-DKEYGEN_LICENSE_*, from CUSTOM_LICENSE_PUBLIC_KEY /
@@ -117,6 +124,8 @@ static void console_log(const char *fmt, ...)
 
 /* ------------------------------------------------------- in-memory key patch */
 
+#if !defined(__arm__)
+
 /* Match chunks idx..7 of oldk in buf at offsets >= after, with at most
  * KEY_GAP_MAX bytes between consecutive chunks (the same greedy search the
  * reference key patcher uses).  ends[] receives the offset of each chunk;
@@ -174,6 +183,121 @@ static int replace_key(unsigned char *buf, size_t len,
 	}
 	return hits;
 }
+
+#else /* __arm__ */
+
+/*
+ * The arm32 builds (the routeros arm64 CHR userspace is AArch32) materialise
+ * the key differently: seven of the eight words sit in a .text literal pool
+ * right after the verifier - in the order chunk 4, 5, 2, 0, 1, 6, 7 - and
+ * the fourth word is computed as chunk2 + 0x1E4FD640 with three
+ * `add rX, rX, #imm` instructions.  The pool words are patched in place and
+ * the add sequence is rewritten to `movw rX, #lo(new3)` / `movt rX, #hi(new3)`
+ * / nop, which does not depend on the old immediates and always encodes.
+ * (Verified against 7.23.7 and 7.24.4 mode/keyman/loader.)
+ */
+
+static unsigned int arm_rd32(const unsigned char *p)
+{
+	return (unsigned int)p[0] | ((unsigned int)p[1] << 8) |
+	       ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+}
+
+static void arm_wr32(unsigned char *p, unsigned int v)
+{
+	p[0] = (unsigned char)v;
+	p[1] = (unsigned char)(v >> 8);
+	p[2] = (unsigned char)(v >> 16);
+	p[3] = (unsigned char)(v >> 24);
+}
+
+/* rewrite the instruction block that derives the fourth key word; site is the
+ * offset of the literal pool, which must be the block's ldr target */
+static int patch_arm_key_site(unsigned char *buf, size_t len, size_t site,
+			      const unsigned char *newk)
+{
+	size_t j;
+
+	for (j = (site >= 256 ? site - 256 : 0); j + 28 <= site; j += 4) {
+		unsigned int w0 = arm_rd32(buf + j);
+		unsigned int w1 = arm_rd32(buf + j + 4);
+		unsigned int w2 = arm_rd32(buf + j + 8);
+		unsigned int w3 = arm_rd32(buf + j + 12);
+		unsigned int w4 = arm_rd32(buf + j + 16);
+		unsigned int w5 = arm_rd32(buf + j + 20);
+		unsigned int w6 = arm_rd32(buf + j + 24);
+		unsigned int r0, r2, r4, r6, t3, t5, word, lo, hi;
+
+		if ((w0 & 0xfffff000u) != 0xe2833000u)	/* add rX, rX, #imm */
+			continue;
+		if (w1 != 0xe1cd00f0u)			/* strd r0, r1, [sp] */
+			continue;
+		if ((w2 & 0xfffff000u) != 0xe2833000u)
+			continue;
+		if ((w3 & 0xfffff000u) != 0xe59f0000u)	/* ldr r0, [pc, #imm] */
+			continue;
+		if ((w4 & 0xfffff000u) != 0xe2833000u)
+			continue;
+		if ((w5 & 0xfffff000u) != 0xe59f1000u)	/* ldr r1, [pc, #imm] */
+			continue;
+		if (w6 != 0xe58d300cu)			/* str rX, [sp, #0xc] */
+			continue;
+		r0 = (w0 >> 12) & 0xf;
+		r2 = (w2 >> 12) & 0xf;
+		r4 = (w4 >> 12) & 0xf;
+		r6 = (w6 >> 12) & 0xf;
+		if (r0 != r2 || r0 != r4 || r0 != r6)
+			continue;
+		if (((w0 >> 16) & 0xf) != r0 || ((w2 >> 16) & 0xf) != r0 ||
+		    ((w4 >> 16) & 0xf) != r0)		/* add: Rn == Rd */
+			continue;
+		t3 = (unsigned int)(j + 12 + 8) + (w3 & 0xfffu);
+		t5 = (unsigned int)(j + 20 + 8) + (w5 & 0xfffu);
+		if ((size_t)t3 != site + 0x14 || (size_t)t5 != site + 0x18)
+			continue;
+
+		/* the custom word as it should land in the 32-byte buffer */
+		word = (unsigned int)newk[12] | ((unsigned int)newk[13] << 8) |
+		       ((unsigned int)newk[14] << 16) |
+		       ((unsigned int)newk[15] << 24);
+		lo = word & 0xffffu;
+		hi = word >> 16;
+		arm_wr32(buf + j, 0xe3000000u | (((lo >> 12) & 0xfu) << 16) |
+			 (r0 << 12) | (lo & 0xfffu));		/* movw */
+		arm_wr32(buf + j + 8, 0xe3400000u | (((hi >> 12) & 0xfu) << 16) |
+			 (r0 << 12) | (hi & 0xfffu));		/* movt */
+		arm_wr32(buf + j + 16, 0xe1a00000u);		/* nop */
+		return 1;
+	}
+	(void)len;
+	return 0;
+}
+
+/* Replace every arm32-style copy of oldk in buf with newk.  Returns the number
+ * of sites patched. */
+static int replace_key(unsigned char *buf, size_t len,
+		       const unsigned char *oldk, const unsigned char *newk)
+{
+	static const int order[7] = { 4, 5, 2, 0, 1, 6, 7 };
+	unsigned char pat[28];
+	size_t i;
+	int c, hits = 0;
+
+	for (c = 0; c < 7; c++)
+		memcpy(pat + 4 * c, oldk + 4 * order[c], 4);
+	for (i = 0; i + sizeof(pat) <= len; i++) {
+		if (memcmp(buf + i, pat, sizeof(pat)) != 0)
+			continue;
+		if (!patch_arm_key_site(buf, len, i, newk))
+			continue;
+		for (c = 0; c < 7; c++)
+			memcpy(buf + i + 4 * c, newk + 4 * order[c], 4);
+		hits++;
+	}
+	return hits;
+}
+
+#endif /* !__arm__ */
 
 static const char *parse_hex_ul(const char *s, unsigned long *out)
 {

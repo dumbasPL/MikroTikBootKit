@@ -1,12 +1,12 @@
 name: Test
 
 # Whole-chain test in both image modes (CHR and x86), by default on the latest
-# RouterOS release.
+# RouterOS release, plus the arm64 CHR.
 #
 # The version is resolved first: the version input if one was given, otherwise
 # the newest release on the channel asked for (the ROUTEROS_CHANNEL repository
 # variable, default "stable") straight from upgrade.mikrotik.com - the same
-# NEWESTa7.<channel> endpoint the routers use.  Each matrix job then:
+# NEWESTa7.<channel> endpoint the routers use.  Each x86 matrix job then:
 #   1. builds the kit (ptrace_init, the loader and bootkit.img),
 #   2. installs a clean RouterOS image from the stock installer ISO with
 #      ./vmtest.sh iso-install (EFI mode, so the layout matches the images the
@@ -16,10 +16,16 @@ name: Test
 #      loader + tracer + LD_PRELOAD probe lines on the serial console,
 #   4. logs in with admin/admin and checks the licence the probe installed
 #      (p-unlimited on CHR, no demo countdown on x86).
+# The arm64 job uses the stock chr-<ver>-arm64.img.zip instead of the ISO
+# (there is no arm64 installer ISO): ./vmtest.sh unpacks it, installs the kit
+# and checks the same lines and the p-unlimited licence; the CHR arm64
+# userspace is AArch32, so the probe and the tracer are built as arm32.
 #
 # GitHub-hosted runners have no usable KVM, so the QEMU accelerator is probed
 # and falls back to emulation (TCG); a self-hosted runner with /dev/kvm uses
-# KVM and runs much faster.  daily.yml calls this workflow once a day.
+# KVM and runs much faster.  The arm64 job always emulates (TCG + cortex-a72:
+# the CHR arm64 kernel hangs with -cpu max).  daily.yml calls this workflow
+# once a day.
 
 on:
   push:
@@ -223,6 +229,109 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vmtest-${{ matrix.mode }}
+          path: |
+            serial-*.log
+            license-*.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  vmtest-arm64:
+    name: arm64 (RouterOS ${{ needs.version.outputs.version }})
+    needs: version
+    runs-on: ubuntu-latest
+    # TCG-only and slower than the x86 jobs (no KVM on hosted runners)
+    timeout-minutes: 240
+    concurrency:
+      group: test-${{ github.ref }}-arm64
+      cancel-in-progress: true
+    env:
+      ROUTEROS_VERSION: ${{ needs.version.outputs.version }}
+      ARCH: arm64
+      WAIT: "900"
+      IMG_SRC: ${{ github.workspace }}/.work/chr-${{ needs.version.outputs.version }}-arm64.img.zip
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc-arm-linux-gnueabihf clang lld \
+            qemu-system-arm qemu-efi-aarch64 mtools cpio unzip
+
+      - name: Cache the arm musl toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            .toolchain/cache
+            .toolchain/arm-musl
+          key: musl-arm-${{ runner.os }}-${{ hashFiles('tools/musl_arm.sh') }}
+
+      # The CHR arm64 image is only distributed as a zip and never changes.
+      - name: Cache the arm64 CHR image
+        uses: actions/cache@v4
+        with:
+          path: .work/chr-${{ env.ROUTEROS_VERSION }}-arm64.img.zip
+          key: routeros-chr-arm64-${{ runner.os }}-${{ env.ROUTEROS_VERSION }}
+
+      - name: Download the arm64 CHR image
+        run: |
+          set -euo pipefail
+          zip=".work/chr-$ROUTEROS_VERSION-arm64.img.zip"
+          if [ ! -f "$zip" ]; then
+            mkdir -p .work
+            url="https://download.mikrotik.com/routeros/$ROUTEROS_VERSION/chr-$ROUTEROS_VERSION-arm64.img.zip"
+            echo "downloading $url"
+            curl -fL --retry 3 -o "$zip.part" "$url"
+            mv "$zip.part" "$zip"
+          fi
+          ls -l "$zip"
+          sha256sum "$zip" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install a clean image and test the direct install
+        run: |
+          set -euo pipefail
+          ./vmtest.sh test
+          cp .work/serial.log serial-direct.log
+          grep -aq 'efiboot:' .work/serial.log
+          grep -aq 'ptrace-init' .work/serial.log
+          grep -aq 'ldpreload. loaded by' .work/serial.log
+          [ "$(grep -ac 'ldpreload. loaded by' .work/serial.log)" -ge 5 ]
+          grep -aq 'mode: licence' .work/serial.log
+          grep -aq 'keyman: licence key patched' .work/serial.log
+          grep -aqE 'BdsDxe: (loading|starting) Boot.*MikroTikBootKit' .work/serial.log
+
+      - name: Check the licence and stop the direct VM
+        run: |
+          set -euo pipefail
+          ./vmtest.sh cmd "/system license print" | tee license-direct.txt
+          ./vmtest.sh stop
+          grep -aqE 'system-id' license-direct.txt
+          grep -aq 'level: p-unlimited' license-direct.txt
+          ! grep -aq 'expires-in' license-direct.txt
+          cp .work/serial.log serial-direct-login.log
+
+      - name: Test the removable install
+        run: |
+          set -euo pipefail
+          ./vmtest.sh test-removable
+          cp .work/serial.log serial-removable.log
+          grep -aq 'ptrace-init' .work/serial.log
+          grep -aq 'ldpreload. loaded by' .work/serial.log
+          [ "$(grep -ac 'ldpreload. loaded by' .work/serial.log)" -ge 5 ]
+          grep -aq 'mode: licence' .work/serial.log
+          ./vmtest.sh cmd "/system license print" | tee license-removable.txt
+          ./vmtest.sh stop
+          grep -aqE 'system-id' license-removable.txt
+          grep -aq 'level: p-unlimited' license-removable.txt
+          cp .work/serial.log serial-removable-login.log
+
+      - name: Upload the serial logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmtest-arm64
           path: |
             serial-*.log
             license-*.txt

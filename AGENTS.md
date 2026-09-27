@@ -36,11 +36,30 @@ Boot-time tooling for MikroTik RouterOS images.  Two pieces:
   Both end with "press any key to reboot".  `--install` in the load options
   forces the menu even when a valid config exists.
 
+  The **arm64 CHR** works the same way through a second, AArch64 loader
+  (`bootkit-arm64.efi`, installed stick as `\EFI\BOOT\BOOTAA64.EFI` in
+  `bootkit-arm64.img`).  It boots the stock kernel at
+  `\EFI\BOOT\BOOTAA64.EFI` with LoadImage/StartImage - the arm64 kernel is a
+  PE/COFF EFI application and its stub keeps the EFI runtime environment -
+  and passes the initramfs through the kernel's `initrd=<file>` command line
+  option, which the loader serves from a one-file RAM volume.  That is needed
+  because the 5.6 arm64 stub has no LoadFile2 initrd support and the boot is
+  ACPI (no device tree to put `linux,initrd-start` in).  The stock CHR
+  initramfs (the stage-1 `/init`) is XZ-compressed inside the kernel image
+  and a kernel-supplied initrd replaces it, so the loader locates that XZ
+  stream and hands the kernel "[stock stream][the kit's cpio]" as one initrd
+  - Linux unpacks concatenated archives, so the stock rootfs and the kit's
+  `/ptrace_init` both appear.  The arm64 CHR's userspace is **AArch32**
+  (armv7, soft-float), so the probe and the tracer are arm32 binaries; see
+  `bootkit/` below.
+
   `DEBUG=1 ./build.sh` makes this a *test build*: new configs get
-  `debug=1`, which adds `console=ttyS0,115200n8 bootkit_debug=1` to the
-  kernel command line and turns on the verbose tracer/probe logs.  The
-  default (production) build writes `debug=0`: no console option and only the
-  important probe lines (licence state, the three patches) plus errors.  The
+  `debug=1`, which adds the serial console to the x86 kernel command line
+  (`console=ttyS0,115200n8 bootkit_debug=1`; on arm64 the base line already
+  carries `console=ttyAMA0,115200n8`, so only `bootkit_debug=1` is added) and
+  turns on the verbose tracer/probe logs.  The default (production) build
+  writes `debug=0`: only the important probe lines (licence state, the three
+  patches) plus errors.  The
   `debug=` line in `\BOOTKIT.CFG` overrides this per boot; edit it to switch
   either way without rebuilding.
 
@@ -57,6 +76,11 @@ Boot-time tooling for MikroTik RouterOS images.  Two pieces:
   signs and installs the licence with the custom key pair, and in `mode` and
   `keyman` it replaces the licence public key the stock verifier builds on its
   stack.  Nothing in the RouterOS image is modified on disk.
+  The arm64 CHR runs an AArch32 (armv7 soft-float) userspace, so for it the
+  tracer is built as an arm32 static musl binary and the probe as an armv7
+  soft-float shared object (`.toolchain/arm-musl`, `tools/musl_arm.sh`); the
+  licence key is materialised differently there (a `.text` literal pool plus
+  an arithmetic word, see `docs/ptrace-init-preload.md`).
 
 Design notes, the target behaviours it relies on and the observed boot log:
 `docs/ptrace-init-preload.md`.
@@ -64,28 +88,37 @@ Design notes, the target behaviours it relies on and the observed boot log:
 ## Layout
 
 ```
-bootkit/                    the RouterOS-side initramfs kit
-  ptrace_init.c             alternative init that drops the probe (static i386)
+bootkit/                    the RouterOS-side initramfs kit (i386 and arm32)
+  ptrace_init.c             alternative init that drops the probe (static)
   preload.c                 LD_PRELOAD probe: console log, in-memory key patch,
                             embedded keygen glue
   keygen.c                  embeddable licence keygen (Curve25519 EC-KCDSA)
-bootloader/                 the EFI-side loader (-> \EFI\BOOT\BOOTKIT.EFI)
+bootloader/                 the EFI-side loaders (-> \EFI\BOOT\BOOTKIT.EFI)
   efi_main.c                entry point: config -> boot, otherwise install menu
   efi.[ch]                  minimal EFI subset: types, console, files, paths
   bootabi.h                 x86 boot protocol structs (setup header, boot_params)
-  boot.c                    loads \EFI\BOOT\BOOTX64.EFI and EFI-handovers into it
+  boot.c                    x86_64: loads \EFI\BOOT\BOOTX64.EFI and
+                            EFI-handovers into it
+  boot_arm64.c              AArch64: LoadImage/StartImage's
+                            \EFI\BOOT\BOOTAA64.EFI and passes "[stock XZ
+                            initramfs][kit cpio]" through the stub's initrd=
+  initrdvol.[ch]            the one-file RAM volume that initrd= reads from
   config.[ch]               \BOOTKIT.CFG: target ESP identity, read/write/find
   vars.c                    Boot#### creation and BootOrder update
   installer.c               install menu (direct / removable)
 tools/musl_i386.sh          builds the local i486-musl toolchain (downloads
                             and compiles musl; picked up by build.sh)
-build.sh                    builds the bootkit, the bootloader and bootkit.img
+tools/musl_arm.sh           builds the armv7-musl toolchain for the arm64 CHR
+                            (needs a host arm-linux-gnueabihf-gcc)
+build.sh                    builds both kits, both loaders and both sticks
 vmtest.sh                   prepare/install/boot/interact with a test image copy,
-                            install a clean image from an installer ISO
+                            install a clean image from an installer ISO (x86) or
+                            unpack a CHR *.img.zip (arm64)
 vmconsole.py                serial-console helper used by vmtest.sh cmd and the
                             bootkit/RouterOS installer drivers
 .github/workflows/test.yml  whole-chain CI: iso-install + direct/removable
-                            tests on CHR and x86 (TCG on hosted runners)
+                            tests on CHR and x86, plus arm64 (TCG on hosted
+                            runners)
 .github/workflows/daily.yml daily call of test.yml on the latest RouterOS
 docs/ptrace-init-preload.md design + findings + verified log
 ```
@@ -93,21 +126,29 @@ docs/ptrace-init-preload.md design + findings + verified log
 ## Build
 
 ```sh
-./build.sh                  # production build:
-                            #   ./ptrace_init (static i386, ~90 KB with the probe)
-                            #   ./bootkit.efi (EFI application, ~110 KB with the
-                            #   embedded initramfs)
-                            #   ./bootkit.img (32 MB USB stick image of the loader)
+./build.sh                  # production build of both architectures:
+                            #   ./ptrace_init      static i386, ~90 KB with the probe
+                            #   ./bootkit.efi      x86_64 EFI app, ~110 KB with the
+                            #                      embedded initramfs
+                            #   ./bootkit.img      32 MB x86 USB stick image
+                            #   ./ptrace_init-arm  static arm32 (armv7) for the CHR arm64
+                            #   ./bootkit-arm64.efi  AArch64 EFI app
+                            #   ./bootkit-arm64.img  32 MB arm64 USB stick image
+ARCH=x86 ./build.sh         # only the x86_64 pair (no arm toolchain needed)
+ARCH=arm64 ./build.sh       # only the arm64 pair (needs clang; the arm musl
+                            # toolchain is built automatically)
 DEBUG=1 ./build.sh          # test build: serial console + verbose logs
 ```
 
-`bootkit.img` is a 32 MB MBR disk with one FAT EFI system partition (type
-0xEF, label `BKINSTALL`) holding `\EFI\BOOT\BOOTX64.EFI` = `bootkit.efi`.
-Flash it to a USB stick and boot the router from it (the firmware's
-removable-media fallback finds it):
+`bootkit.img` / `bootkit-arm64.img` are 32 MB MBR disks with one FAT EFI
+system partition (type 0xEF, labels `BKINSTALL` / `BKINSTALL64`) holding
+`\EFI\BOOT\BOOTX64.EFI` = `bootkit.efi` and `\EFI\BOOT\BOOTAA64.EFI` =
+`bootkit-arm64.efi` respectively.  Flash the one for the target and boot the
+router from it (the firmware's removable-media fallback finds it):
 
 ```sh
-dd if=bootkit.img of=/dev/sdX bs=4M conv=fsync status=progress
+dd if=bootkit.img of=/dev/sdX bs=4M conv=fsync status=progress         # x86
+dd if=bootkit-arm64.img of=/dev/sdX bs=4M conv=fsync status=progress   # arm64 CHR
 ```
 
 `USB_MB=<n>` changes the image size.  With no `\BOOTKIT.CFG` on the stick the
@@ -127,8 +168,15 @@ The script packs the freshly built `ptrace_init` into a cpio (`initrd.cpio`,
 embedded via the generated `bootloader/initrd_so.h`), so `bootkit.efi` is
 self-contained: only the stock kernel sits next to it on the ESP, plus the
 `Boot####` entry that points at the loader.  The kernel path and the base/debug
-command line fragments are at the top of `bootloader/boot.c`; the `debug=`
+command line fragments are at the top of `bootloader/boot.c` (x86_64) and
+`bootloader/boot_arm64.c` (arm64; the base line also sets `console=ttyAMA0`,
+the QEMU virt PL011, because the CHR console lives there); the `debug=`
 setting in `\BOOTKIT.CFG` picks which fragments are used on each boot.
+
+The EFI loaders define the small EFI subset they need themselves
+(`-nostdlib`, no gnu-efi).  The AArch64 one must be built with clang +
+lld-link (`--target=aarch64-unknown-windows`; aarch64 UEFI uses the standard
+AAPCS64, so `EFIAPI` is empty there, unlike the x86 ms_abi).
 
 The LD_PRELOAD probe (bootkit/preload.c) is ordinary C linked without libc
 (-nostdlib): no DT_NEEDED entry, the imports are bound at load time by the
@@ -142,26 +190,41 @@ variables `CUSTOM_LICENSE_PUBLIC_KEY` / `CUSTOM_LICENSE_PRIVATE_KEY` (the
 pair) and `MIKRO_LICENSE_PUBLIC_KEY` (the stock key) override it at build
 time.
 
-The i386 binary is always built against musl: `build.sh` uses the local
-`.toolchain/i386-musl`, and if that is missing it runs `tools/musl_i386.sh`
-itself (which needs a multilib host gcc -m32 and network access to fetch
-musl).  The binary is static, so it runs in the initramfs with no libraries.
+The init binaries are always built against musl: `build.sh` uses the local
+`.toolchain/i386-musl` and `.toolchain/arm-musl`, and if one is missing it
+runs `tools/musl_i386.sh` / `tools/musl_arm.sh` itself (the i386 one needs a
+multilib host gcc -m32, the arm one a host `arm-linux-gnueabihf-gcc`; both
+fetch musl if it is not cached).  They are static, so they run in the
+initramfs with no libraries.  The arm32 probe is built soft-float with the
+same sysroot (`-mfloat-abi=soft -nostdlib`) so it matches the AArch32
+RouterOS processes it is preloaded into.
 
 ## Test
 
-Needs: KVM (the default accelerator; use `ACCEL=tcg` where there is no
-`/dev/kvm`, e.g. hosted CI runners), `clang` + `lld` (or
-`x86_64-w64-mingw32-gcc`), OVMF (Arch's `edk2-ovmf` or Debian/Ubuntu's `ovmf`
-- the paths are found automatically and `OVMF_CODE`/`OVMF_VARS` override),
-`mtools` (`mformat`/`mmd`/`mcopy` also build `bootkit.img`), `cpio`, and a
-RouterOS x86 image.  Use a *copy* of the image; the ESP (partition 1) is
-rewritten.  Always kill the VM by pidfile when done — do not leave QEMU
-instances running.  Installing from an ISO additionally needs `isoinfo`
-(genisoimage) or `xorriso` and a `mikrotik-*.iso`.
+Needs: KVM (the default accelerator on x86_64; use `ACCEL=tcg` where there is
+no `/dev/kvm`, e.g. hosted CI runners), `clang` + `lld` (or
+`x86_64-w64-mingw32-gcc` for the x86 loader only), OVMF (Arch's `edk2-ovmf` or
+Debian/Ubuntu's `ovmf` - the paths are found automatically and
+`OVMF_CODE`/`OVMF_VARS` override), `mtools` (`mformat`/`mmd`/`mcopy` also
+build the sticks), `cpio`, and a RouterOS x86 image.  Use a *copy* of the
+image; the ESP (partition 1) is rewritten.  Always kill the VM by pidfile
+when done — do not leave QEMU instances running.  Installing from an ISO
+additionally needs `isoinfo` (genisoimage) or `xorriso` and a `mikrotik-*.iso`.
+
+For the **arm64 CHR** set `ARCH=arm64` and point `IMG_SRC` at the stock
+`chr-<ver>-arm64.img.zip` (or an extracted `.img`; `vmtest.sh` unpacks a zip
+itself).  That needs `qemu-system-aarch64` (Ubuntu: `qemu-system-arm`), the
+matched 64 MiB AAVMF pair (Ubuntu: `qemu-efi-aarch64`; Arch: `edk2-aarch64`;
+`AAVMF_CODE`/`AAVMF_VARS` override) and a host `arm-linux-gnueabihf-gcc` for
+the arm32 probe.  The arm64 run always uses TCG with `-cpu cortex-a72` (the
+CHR arm64 kernel hangs with `-cpu max`) and boots to `CHR Login:` on
+`ttyAMA0`.  Note that `/system check-installation` fails on arm64 CHR under
+QEMU by itself (the empty-DTB capability-file check), independent of the kit.
 
 `./vmtest.sh test` does all of the following on a copy (direct install).
-`./vmtest.sh prepare` builds the kit, the test image and copies `bootkit.img`
-as the installer stick; `./vmtest.sh install` boots stick + target, drives the
+`./vmtest.sh prepare` builds the kit, the test image and copies the arch's
+boot image (`bootkit.img` for x86_64, `bootkit-arm64.img` for arm64) as the
+installer stick; `./vmtest.sh install` boots stick + target, drives the
 installer over the serial console (`INSTALL_MODE=1` direct or `=2` removable)
 and restores the target kernel; `./vmtest.sh boot` then starts the target
 normally (through the entry the installer created) and `./vmtest.sh
@@ -228,9 +291,22 @@ that does not exist yet, so a full run from an ISO is:
 IMG_SRC=./mikrotik-7.24.4.iso MODE=chr ./vmtest.sh test
 ```
 
+For the arm64 CHR the whole run is (a stock image, no ISO):
+
+```sh
+ARCH=arm64 IMG_SRC=./chr-7.24.4-arm64.img.zip ./vmtest.sh test
+ARCH=arm64 IMG_SRC=./chr-7.24.4-arm64.img.zip ./vmtest.sh test-removable
+# or with an extracted image: ARCH=arm64 IMG_SRC=./chr-7.24.4-arm64.img ...
+```
+
+The harness walks the first login (licence question/pager and the forced
+password change to admin/admin) on its own, so `./vmtest.sh cmd "/system
+license print"` works on a stock image too.
+
 `.github/workflows/test.yml` runs all of that on every push/PR in a CHR and an
-x86 job: it caches the i386-musl toolchain and the installer ISO, installs the
-clean image once per job and then runs the direct and the removable test with
+x86 job, plus an arm64 job on the stock CHR `*.img.zip`: it caches the
+i386/arm musl toolchains and the installer ISO / CHR image, installs the clean
+image once per job and then runs the direct and the removable test with
 loader/tracer/probe and licence assertions (and uploads the serial logs).
 GitHub-hosted runners have no usable KVM, so the workflow probes it and falls
 back to `ACCEL=tcg` with a longer `WAIT`.  The RouterOS version is resolved
@@ -242,15 +318,18 @@ version.
 
 ### Installing on real hardware
 
-1. Flash `bootkit.img` to a USB stick and boot the router from it (the
-   firmware's removable-media fallback finds `\EFI\BOOT\BOOTX64.EFI`):
+1. Flash the stick for the target (x86: `bootkit.img`, arm64 CHR:
+   `bootkit-arm64.img`) and boot the router from it (the firmware's
+   removable-media fallback finds `\EFI\BOOT\BOOTX64.EFI` /
+   `\EFI\BOOT\BOOTAA64.EFI`):
 
    ```sh
-   dd if=bootkit.img of=/dev/sdX bs=4M conv=fsync status=progress
+   dd if=bootkit.img of=/dev/sdX bs=4M conv=fsync status=progress         # x86
+   dd if=bootkit-arm64.img of=/dev/sdX bs=4M conv=fsync status=progress   # arm64
    ```
 
-   (Copying `bootkit.efi` to a plain FAT stick as `\EFI\BOOT\BOOTX64.EFI` works
-   the same way if there is no `bootkit.img` at hand.)
+   (Copying `bootkit.efi` / `bootkit-arm64.efi` to a plain FAT stick as the
+   same path works the same way if there is no `.img` at hand.)
 2. The loader finds no `\BOOTKIT.CFG` and starts the install menu: pick the
    EFI partition where RouterOS is installed, then the mode.
    * **direct**: it copies itself to `\EFI\BOOT\BOOTKIT.EFI` there, writes
@@ -262,9 +341,10 @@ version.
      loader will follow the config and boot RouterOS from the internal ESP.
 3. Both modes end with "press any key to reboot".
 
-The stock kernel at `\EFI\BOOT\BOOTX64.EFI` is never touched, so a RouterOS
-update can replace it freely: the config still finds the partition, and the
-loader boots the updated kernel with the kit's initramfs.  If an update also
+The stock kernel at `\EFI\BOOT\BOOTX64.EFI` (x86) / `\EFI\BOOT\BOOTAA64.EFI`
+(arm64) is never touched, so a RouterOS update can replace it freely: the
+config still finds the partition, and the loader boots the updated kernel with
+the kit's initramfs.  If an update also
 rewrites `BootOrder` (some installers re-add their own entry), just move
 `MikroTikBootKit` back to the top once with `efibootmgr -o ...` or the
 firmware menu.  The menu can also be forced with `--install` (e.g. from the
@@ -301,7 +381,10 @@ efiboot: kernel 5.6.3-64 (gitlab-runner@cicd-a13.mt.lv) #1 SMP ...
 efiboot: initrd 94720 bytes, booting (rdinit=/ptrace_init)
 efiboot: initrd 94720 bytes, booting (rdinit=/ptrace_init console=ttyS0,115200n8 bootkit_debug=1)
 ```
-(the second line is with `debug=1`)
+(the second line is with `debug=1`; on arm64 the line is
+`efiboot: initrd 171120 bytes (stock 81008 + kit 90112), booting
+(rdinit=/ptrace_init initrd=initrd.cpio console=ttyAMA0,115200n8
+bootkit_debug=1)` - the stock XZ initramfs plus the kit's cpio)
 
 Expected tracer output (with `debug=1`):
 
@@ -330,7 +413,11 @@ when the stored one no longer verifies).
 ### Notes / gotchas
 
 * **Known versions:** works on 7.23.7 and 7.24.4 (both x86 and CHR mode,
-  40-47 loads, boot reaches the login prompt).  On 7.24.4 the kernel refuses
+  40-47 loads, boot reaches the login prompt).  The arm64 CHR of those
+  versions is covered too: its userspace is AArch32, so the same probe is
+  built as armv7 soft-float and the licence key is patched in its own
+  encoding (a `.text` literal pool plus an arithmetic word; see
+  `docs/ptrace-init-preload.md`).  On 7.24.4 the kernel refuses
   `PROT_EXEC` mappings of tmpfs files, so the probe is not written to `/ram`
   but bind-mounted there from a copy kept on the initramfs; the same kernel
   also rejects `mprotect(PROT_READ|PROT_WRITE|PROT_EXEC)`, so the in-memory
@@ -392,6 +479,23 @@ when the stored one no longer verifies).
   console log for the `[ldpreload]` lines; `/ram/ldpreload.so` is on the
   running system's tmpfs.  The first login may walk through a forced password
   change — use a fresh image copy if you need the CLI.
+* **arm64 CHR:** the boot is ACPI, so the kernel's EFI stub generates an empty
+  DTB and there is no `linux,initrd-start` path for the kit's cpio; the 5.6
+  stub has no LoadFile2 initrd support either.  The loader therefore passes
+  `initrd=initrd.cpio` and serves the file from a RAM volume it installs on a
+  new handle, then points the loaded kernel's `DeviceHandle` at it (the stub
+  reads `initrd=` from the kernel image's own device handle).  The stock
+  initramfs is an XZ stream inside the kernel's `.data`; since a kernel
+  initrd replaces it, the loader locates that stream (magic + footer CRC32)
+  and prepends it to the kit's cpio, and Linux unpacks the concatenation.
+  Do not point `initrd=` at a file on disk: direct installs would have to
+  write it, and removable installs must leave the target alone.
+* **arm64 CHR QEMU specifics:** use `-M virt -cpu cortex-a72` (`-cpu max`
+  hangs this kernel) and a *matched* 64 MiB AAVMF code/vars pair; the console
+  is ttyAMA0, and the arm64 CHR image itself is always CHR mode.  The stock
+  `/system check-installation` fails under QEMU on arm64 (RouterOS's ARM
+  checker wants `/ram` capability files that the empty DTB cannot provide) -
+  that is a pre-existing RouterOS/QEMU limitation, not the kit.
 * `docs/ptrace-init-preload.md` lists the target behaviours the logic depends
   on (the init's stage-1 root switch, the early `/ram` mount).
   Re-read it before "simplifying" the tracer loop.

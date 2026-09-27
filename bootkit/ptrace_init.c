@@ -56,7 +56,10 @@ extern char **environ;
 static int stash_fd = -1;
 
 /* the LD_PRELOAD probe (preload.c), embedded by build.sh */
-#include "preload_so.h"
+#ifndef PRELOAD_SO_HEADER
+#define PRELOAD_SO_HEADER "preload_so.h"
+#endif
+#include PRELOAD_SO_HEADER
 
 #ifndef __WALL
 #define __WALL 0x40000000

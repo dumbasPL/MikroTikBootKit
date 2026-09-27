@@ -22,6 +22,22 @@ Boot-time tooling for MikroTik RouterOS images.  Two pieces:
   `\EFI\BOOT\BOOTX64.EFI` from it and boots it; a RouterOS update overwriting
   that file is picked up on the next boot.
 
+  `target=auto` in the config is *auto mode*: the loader installs nothing and
+  boots the first RouterOS kernel it can find instead of following a
+  partition identity.  `bootkit-auto.img` is the stick built around it: it
+  carries **both** loaders (`\EFI\BOOT\BOOTX64.EFI` and
+  `\EFI\BOOT\BOOTAA64.EFI`) and `\BOOTKIT.CFG` = `target=auto`
+  (`bootloader/auto.cfg`), so the same stick boots on x86 and on the arm64
+  CHR - whichever loader the firmware starts scans every file system the
+  firmware exposes and boots the first file that looks like the stock
+  RouterOS kernel: on x86 a bzImage setup header with the 64-bit EFI handover
+  entry, on arm64 the XZ stock-initramfs stream the loader needs for the
+  initrd.  The loader's own file (the stick has it at that very path) matches
+  neither check, so the stick never boots itself.  Nothing is written
+  anywhere - no config, no boot entry - so the target stays untouched and the
+  stick works as a rescue/utility medium; with no kernel found (or with
+  `--install`) the loader falls back to the install menu.
+
   If the config is missing, unreadable or points at a partition that is not
   there, the loader runs its install menu instead: pick the RouterOS ESP, then
   pick a mode -
@@ -103,9 +119,11 @@ bootloader/                 the EFI-side loaders (-> \EFI\BOOT\BOOTKIT.EFI)
                             \EFI\BOOT\BOOTAA64.EFI and passes "[stock XZ
                             initramfs][kit cpio]" through the stub's initrd=
   initrdvol.[ch]            the one-file RAM volume that initrd= reads from
-  config.[ch]               \BOOTKIT.CFG: target ESP identity, read/write/find
+  config.[ch]               \BOOTKIT.CFG: target ESP identity (or the "auto"
+                            magic value), read/write/find
   vars.c                    Boot#### creation and BootOrder update
   installer.c               install menu (direct / removable)
+  auto.cfg                  the \BOOTKIT.CFG of bootkit-auto.img (target=auto)
 tools/musl_i386.sh          builds the local i486-musl toolchain (downloads
                             and compiles musl; picked up by the Makefile)
 tools/musl_arm.sh           builds the armv7-musl toolchain for the arm64 CHR
@@ -114,14 +132,15 @@ tools/embed.py              writes a binary as a C array header (the probe into
                             ptrace_init, the cpio into the EFI loaders)
 tools/mkinitrd.sh           packs ptrace_init as the cpio/newc initramfs
 tools/bootkit_img.sh        builds a bootkit*.img USB stick (MBR + FAT ESP)
+                            from <src> <dest> file pairs
 tools/mbr.py                writes the stick MBR (partition + fixed signature)
-Makefile                    builds both kits, both loaders and both sticks
+Makefile                    builds both kits, both loaders and the three sticks
 vmtest.sh                   prepare/install/boot/interact with a test image copy,
                             install a clean image from an installer ISO (x86) or
                             unpack a CHR *.img.zip (arm64)
 vmconsole.py                serial-console helper used by vmtest.sh cmd and the
                             bootkit/RouterOS installer drivers
-.github/workflows/test.yml  whole-chain CI: iso-install + direct/removable
+.github/workflows/test.yml  whole-chain CI: iso-install + direct/removable/auto
                             tests on CHR and x86, plus arm64 (TCG on hosted
                             runners)
 .github/workflows/daily.yml daily call of test.yml on the latest RouterOS
@@ -139,32 +158,41 @@ make                        # production build of both architectures:
                             #   ./ptrace_init-arm  static arm32 (armv7) for the CHR arm64
                             #   ./bootkit-arm64.efi  AArch64 EFI app
                             #   ./bootkit-arm64.img  32 MB arm64 USB stick image
+                            #   ./bootkit-auto.img   32 MB both-arch auto stick
+                            #                      (both loaders + target=auto)
 make x86                    # only the x86_64 pair (no arm toolchain needed)
 make arm64                  # only the arm64 pair (needs clang; the arm musl
                             # toolchain is built automatically)
+make bootkit-auto.img       # only the auto stick (needs both, as make does)
 make DEBUG=1                # test build: serial console + verbose logs
 make clean                  # remove the generated artifacts and .build/
 ```
 
-`make` skips arm64 with a warning when clang + lld-link or the ARM cross
-compiler are not installed; `make arm64` fails in that case.  The other build
+`make` skips arm64 and `bootkit-auto.img` with a warning when clang +
+lld-link or the ARM cross compiler are not installed; `make arm64` and
+`make bootkit-auto.img` fail in that case.  The other build
 variables are `EFI_CC=` (x86 loader compiler), `ARM_CC=`, `USB_MB=` and `OUT=`.
 
 `bootkit.img` / `bootkit-arm64.img` are 32 MB MBR disks with one FAT EFI
 system partition (type 0xEF, labels `BKINSTALL` / `BKINSTALL64`) holding
 `\EFI\BOOT\BOOTX64.EFI` = `bootkit.efi` and `\EFI\BOOT\BOOTAA64.EFI` =
-`bootkit-arm64.efi` respectively.  Flash the one for the target and boot the
-router from it (the firmware's removable-media fallback finds it):
+`bootkit-arm64.efi` respectively.  `bootkit-auto.img` (label `BKAUTO`) has the
+same layout with *both* loaders plus `\BOOTKIT.CFG` = `target=auto`.  Flash
+the one for the target and boot the router from it (the firmware's
+removable-media fallback finds it):
 
 ```sh
 dd if=bootkit.img of=/dev/sdX bs=4M conv=fsync status=progress         # x86
 dd if=bootkit-arm64.img of=/dev/sdX bs=4M conv=fsync status=progress   # arm64 CHR
+dd if=bootkit-auto.img of=/dev/sdX bs=4M conv=fsync status=progress    # both, auto
 ```
 
 `USB_MB=<n>` changes the image size.  With no `\BOOTKIT.CFG` on the stick the
 loader starts its direct/removable install menu; a removable install writes
 the config to the same FAT partition, after which the stick can boot RouterOS
-without touching the router's NVRAM.
+without touching the router's NVRAM.  The auto stick ships that config as
+`target=auto`, so it boots the first RouterOS kernel it finds and writes
+nothing at all.
 
 The EFI loader is built by the same Makefile; it defines the small EFI subset
 it needs itself (`-nostdlib`, no gnu-efi), so apart from the usual build tools
@@ -239,7 +267,10 @@ installer over the serial console (`INSTALL_MODE=1` direct or `=2` removable)
 and restores the target kernel; `./vmtest.sh boot` then starts the target
 normally (through the entry the installer created) and `./vmtest.sh
 test-removable` / `boot-removable` cover the removable mode (stick first,
-bootindex); `./vmtest.sh cmd "<cli command>"` logs into the running VM as
+bootindex); `./vmtest.sh test-auto` / `boot-auto` build `bootkit-auto.img`
+(so the arm64 side is needed as well) and boot it with the target: nothing is
+installed, the loader scans the partitions and boots the target's kernel by
+itself; `./vmtest.sh cmd "<cli command>"` logs into the running VM as
 admin/admin.  The harness builds a test build (`DEBUG=1`, override with
 `DEBUG=0`); with a production image `check` shows no tracer/load lines and the
 tracer/probe output only appears after flipping `debug=1` in the config:
@@ -360,6 +391,15 @@ rewrites `BootOrder` (some installers re-add their own entry), just move
 firmware menu.  The menu can also be forced with `--install` (e.g. from the
 UEFI shell: `fs0:\EFI\BOOT\BOOTKIT.EFI --install`).
 
+For just booting an already installed system with the kit's initramfs -
+nothing installed, no boot entry, the router left untouched - flash
+`bootkit-auto.img` instead: it carries both loaders and a `\BOOTKIT.CFG` with
+`target=auto`, so whichever loader the firmware starts scans the partitions
+and boots the first RouterOS kernel it finds (its own files do not match the
+kernel checks, so it never boots itself).  Keep the stick plugged in and
+select it in the boot menu, or give it a `Boot####` entry; a RouterOS update
+does not disturb it.
+
 Expected installer output (direct mode):
 
 ```
@@ -395,6 +435,17 @@ efiboot: initrd 94720 bytes, booting (rdinit=/ptrace_init console=ttyS0,115200n8
 `efiboot: initrd 171120 bytes (stock 81008 + kit 90112), booting
 (rdinit=/ptrace_init initrd=initrd.cpio console=ttyAMA0,115200n8
 bootkit_debug=1)` - the stock XZ initramfs plus the kit's cpio)
+
+Expected loader output in auto mode (`bootkit-auto.img`, no install; the
+firmware starts whichever loader it finds, here the x86 one on a USB stick):
+
+```
+efiboot: MikroTik boot kit loader
+efiboot: auto mode: looking for the first RouterOS kernel
+efiboot: auto: kernel found on PciRoot(0x0)/Pci(0x4,0x0)/USB(0x0,0x0)/HD(1,MBR,...)
+efiboot: kernel 5.6.3-64 (gitlab-runner@cicd-a13.mt.lv) #1 SMP ...
+efiboot: initrd 94720 bytes, booting (rdinit=/ptrace_init ...)
+```
 
 Expected tracer output (with `debug=1`):
 
@@ -464,7 +515,12 @@ when the stored one no longer verifies).
   identity deliberately excludes the bus topology, so a disk moved to another
   port still matches; a different disk does not and the menu comes up again.
   The device path text is in a comment line for debugging (and shown in the
-  installer listing).
+  installer listing).  The other accepted value is the literal `auto`
+  (`bootloader/auto.cfg` on `bootkit-auto.img`): no identity, no install -
+  the loader boots the first RouterOS kernel it finds and the target is left
+  alone.  `\BOOTKIT.CFG` is read up to 512 bytes (`CONFIG_MAX`), so keep the
+  `target=` line inside that; the shipped auto config has no `debug=` line
+  and gets the build's default.
 * `debug=0|1` in the config is read on every boot: 1 appends
   `console=ttyS0,115200n8 bootkit_debug=1` to the kernel command line (the
   trace/probe logs become visible on serial) and 1/0 is passed to the

@@ -1,8 +1,9 @@
 /*
  * efi_main.c - the loader entry point: read \BOOTKIT.CFG from the volume we
  * were booted from, boot the configured RouterOS ESP (passing its debug=
- * setting on to the kernel command line), or run the install menu when there
- * is no usable config (--install forces the menu).
+ * setting on to the kernel command line; "target=auto" boots the first
+ * RouterOS kernel found instead), or run the install menu when there is no
+ * usable config (--install forces the menu).
  */
 #include "efi.h"
 #include "config.h"
@@ -30,7 +31,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
 	EFI_LOADED_IMAGE_PROTOCOL *li = 0;
 	EFI_FILE_PROTOCOL *root;
 	TARGET_ID target;
-	BOOLEAN debug;
+	BOOLEAN auto_mode, debug;
 	EFI_STATUS status;
 
 	ST = st;
@@ -50,15 +51,23 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
 	/*
 	 * Normal case: the config next to the loader names the partition
 	 * RouterOS is installed on.  Boot \EFI\BOOT\BOOTX64.EFI from there.
-	 * No config (or one that does not point at a partition we can find)
-	 * means the kit was not set up yet: run the install menu.
+	 * "target=auto" instead boots the first RouterOS kernel found
+	 * anywhere (the auto stick).  No config (or one that does not point
+	 * at a partition we can find) means the kit was not set up yet: run
+	 * the install menu.
 	 */
 	status = open_root(image, &root);
 	if (EFI_ERROR(status))
 		return fail(status, L"cannot open the boot volume");
-	status = config_read(root, &target, &debug);
+	status = config_read(root, &target, &auto_mode, &debug);
 	if (EFI_ERROR(status)) {
 		print(L"efiboot: no valid " CONFIG_PATH L" here, starting the installer\r\n");
+	} else if (auto_mode) {
+		print(L"efiboot: auto mode: looking for the first RouterOS kernel\r\n");
+		status = boot_auto(image, debug);
+		if (status != EFI_NOT_FOUND)
+			return status;
+		print(L"efiboot: auto: no RouterOS kernel found, starting the installer\r\n");
 	} else {
 		EFI_FILE_PROTOCOL *target_root;
 

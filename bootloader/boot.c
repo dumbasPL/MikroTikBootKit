@@ -7,6 +7,7 @@
 #include "efi.h"
 #include "bootabi.h"
 #include "boot.h"
+#include "config.h"
 /* the embedded initramfs (the Makefile writes the x86 one as initrd_so.h and
  * the arm64 one as initrd_so_arm.h; each loader is built with the matching
  * -DINITRD_SO_HEADER) */
@@ -61,6 +62,76 @@ static VOID print_kernel_version(const UINT8 *kbuf, UINTN klen)
 	}
 }
 
+/*
+ * The kernel checks the boot path and the auto-mode probe share.  On failure
+ * returns the status and sets *err to the message to report; on success
+ * *setup_total and *kfile_size describe the image.
+ */
+static EFI_STATUS check_kernel(const struct SetupHeader *hdr, UINT64 klen,
+			       UINTN *setup_total, UINT64 *kfile_size, CHAR16 **err)
+{
+	*err = 0;
+	if (hdr->boot_flag != BOOT_FLAG_MAGIC || hdr->header != SETUP_HDR_MAGIC) {
+		*err = L"not a Linux bzImage";
+		return EFI_LOAD_ERROR;
+	}
+	if (hdr->version < SETUP_VERSION_2_11) {
+		*err = L"kernel is too old for EFI handover";
+		return EFI_UNSUPPORTED;
+	}
+	if (!hdr->relocatable_kernel) {
+		*err = L"kernel is not relocatable";
+		return EFI_UNSUPPORTED;
+	}
+	if (!(hdr->xloadflags & XLF_KERNEL_64) ||
+	    !(hdr->xloadflags & XLF_EFI_HANDOVER_64)) {
+		*err = L"kernel has no 64-bit EFI handover entry";
+		return EFI_UNSUPPORTED;
+	}
+	if (!hdr->syssize || !hdr->init_size) {
+		*err = L"kernel image sizes are invalid";
+		return EFI_LOAD_ERROR;
+	}
+
+	*setup_total = ((UINTN)(hdr->setup_sects ? hdr->setup_sects : 4) + 1) * 512;
+	*kfile_size = *setup_total + (UINT64)hdr->syssize * 16;
+	if (*kfile_size > klen) {
+		*err = L"kernel image is truncated";
+		return EFI_LOAD_ERROR;
+	}
+	return EFI_SUCCESS;
+}
+
+/*
+ * target=auto: does \EFI\BOOT\BOOTX64.EFI on this volume look like the stock
+ * RouterOS kernel?  The loader's own file (the auto stick has it at that very
+ * path) has no bzImage setup header, so the stick itself is never picked.
+ */
+static BOOLEAN kernel_probe(EFI_FILE_PROTOCOL *root)
+{
+	EFI_FILE_PROTOCOL *f;
+	struct SetupHeader hdr;
+	CHAR16 *err;
+	EFI_STATUS status;
+	UINTN setup_total;
+	UINT64 kfile_size, klen;
+
+	status = open_file(root, KERNEL_PATH, &f);
+	if (EFI_ERROR(status))
+		return FALSE;
+	status = file_size(f, &klen);
+	if (EFI_ERROR(status) || klen < sizeof(first_page)) {
+		f->Close(f);
+		return FALSE;
+	}
+	status = read_file(f, 0, first_page, sizeof(first_page));
+	f->Close(f);
+	if (EFI_ERROR(status))
+		return FALSE;
+	memcpy(&hdr, first_page + SETUP_HDR_OFFSET, sizeof(hdr));
+	return !EFI_ERROR(check_kernel(&hdr, klen, &setup_total, &kfile_size, &err));
+}
+
 EFI_STATUS boot_from_root(EFI_HANDLE image, EFI_FILE_PROTOCOL *root, BOOLEAN debug)
 {
 	struct SetupHeader hdr;
@@ -68,8 +139,9 @@ EFI_STATUS boot_from_root(EFI_HANDLE image, EFI_FILE_PROTOCOL *root, BOOLEAN deb
 	EFI_FILE_PROTOCOL *f;
 	EFI_PHYSICAL_ADDRESS addr;
 	EFI_STATUS status;
-	UINTN setup_sects, setup_total, kalloc, cmd_len;
+	UINTN setup_total, kalloc, cmd_len;
 	UINT64 kfile_size, kneed, klen, ilen;
+	CHAR16 *err;
 	UINT8 *kbuf = 0, *ibuf = 0;
 	char cmdline[96];
 	CHAR16 *cmd;
@@ -91,23 +163,9 @@ EFI_STATUS boot_from_root(EFI_HANDLE image, EFI_FILE_PROTOCOL *root, BOOLEAN deb
 		return fail(status, L"cannot read the kernel");
 
 	memcpy(&hdr, first_page + SETUP_HDR_OFFSET, sizeof(hdr));
-	if (hdr.boot_flag != BOOT_FLAG_MAGIC || hdr.header != SETUP_HDR_MAGIC)
-		return fail(EFI_LOAD_ERROR, L"not a Linux bzImage");
-	if (hdr.version < SETUP_VERSION_2_11)
-		return fail(EFI_UNSUPPORTED, L"kernel is too old for EFI handover");
-	if (!hdr.relocatable_kernel)
-		return fail(EFI_UNSUPPORTED, L"kernel is not relocatable");
-	if (!(hdr.xloadflags & XLF_KERNEL_64) ||
-	    !(hdr.xloadflags & XLF_EFI_HANDOVER_64))
-		return fail(EFI_UNSUPPORTED, L"kernel has no 64-bit EFI handover entry");
-	if (!hdr.syssize || !hdr.init_size)
-		return fail(EFI_LOAD_ERROR, L"kernel image sizes are invalid");
-
-	setup_sects = hdr.setup_sects ? hdr.setup_sects : 4;
-	setup_total = (setup_sects + 1) * 512;
-	kfile_size = setup_total + (UINT64)hdr.syssize * 16;
-	if (kfile_size > klen)
-		return fail(EFI_LOAD_ERROR, L"kernel image is truncated");
+	status = check_kernel(&hdr, klen, &setup_total, &kfile_size, &err);
+	if (EFI_ERROR(status))
+		return fail(status, err);
 
 	/*
 	 * The EFI stub copies hdr.init_size bytes starting at the protected-mode
@@ -200,4 +258,16 @@ EFI_STATUS boot_from_root(EFI_HANDLE image, EFI_FILE_PROTOCOL *root, BOOLEAN deb
 	__asm__ volatile ("cli");
 	handover(image, ST, params);
 	return EFI_LOAD_ERROR;	/* not reached */
+}
+
+/* target=auto (see config.h): boot the first RouterOS kernel found */
+EFI_STATUS boot_auto(EFI_HANDLE image, BOOLEAN debug)
+{
+	EFI_FILE_PROTOCOL *root;
+	EFI_STATUS status;
+
+	status = find_kernel_root(kernel_probe, &root);
+	if (EFI_ERROR(status))
+		return status;
+	return boot_from_root(image, root, debug);
 }

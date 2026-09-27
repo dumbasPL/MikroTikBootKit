@@ -14,7 +14,10 @@ name: Test
 #   3. installs the bootkit on a copy with ./vmtest.sh test (direct) and
 #      ./vmtest.sh test-removable (removable), boots the target and checks the
 #      loader + tracer + LD_PRELOAD probe lines on the serial console,
-#   4. logs in with admin/admin and checks the licence the probe installed
+#   4. boots the same target through the both-arch auto stick
+#      (./vmtest.sh test-auto: \BOOTKIT.CFG = target=auto - the first RouterOS
+#      kernel found is booted, nothing is installed),
+#   5. logs in with admin/admin and checks the licence the probe installed
 #      (p-unlimited on CHR, no demo countdown on x86).
 # The arm64 job uses the stock chr-<ver>-arm64.img.zip instead of the ISO
 # (there is no arm64 installer ISO): ./vmtest.sh unpacks it, installs the kit
@@ -128,6 +131,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential gcc-multilib libc6-dev-i386 clang lld \
+            gcc-arm-linux-gnueabihf \
             qemu-system-x86 ovmf mtools genisoimage cpio
 
       - name: Cache the i386 musl toolchain
@@ -137,6 +141,16 @@ jobs:
             .toolchain/cache
             .toolchain/i386-musl
           key: musl-i386-${{ runner.os }}-${{ hashFiles('tools/musl_i386.sh') }}
+
+      # bootkit-auto.img carries both loaders, so the x86 jobs build the ARM
+      # side of it too (same cache key as the arm64 job)
+      - name: Cache the arm musl toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            .toolchain/cache
+            .toolchain/arm-musl
+          key: musl-arm-${{ runner.os }}-${{ hashFiles('tools/musl_arm.sh') }}
 
       # The MikroTik CDN is slow from the runners and the ISO never changes.
       - name: Cache the installer ISO
@@ -223,6 +237,32 @@ jobs:
             x86) ! grep -aq 'expires-in' license-removable.txt ;;
           esac
           cp .work/serial.log serial-removable-login.log
+
+      - name: Test the auto stick
+        env:
+          MODE: ${{ matrix.mode }}
+          IMG_SRC: ${{ github.workspace }}/.work/mikrotik-${{ env.ROUTEROS_VERSION }}.iso
+          WAIT: "900"
+        run: |
+          set -euo pipefail
+          ./vmtest.sh test-auto
+          cp .work/serial.log serial-auto.log
+          grep -aq 'efiboot: auto mode: looking for the first RouterOS kernel' .work/serial.log
+          grep -aq 'efiboot: auto: kernel found on' .work/serial.log
+          grep -aq 'ptrace-init' .work/serial.log
+          grep -aq 'ldpreload. loaded by' .work/serial.log
+          [ "$(grep -ac 'ldpreload. loaded by' .work/serial.log)" -ge 5 ]
+          grep -aq 'mode: licence' .work/serial.log
+          # auto mode installs nothing: the installer never runs
+          ! grep -aq 'installer mode' .work/serial.log
+          ./vmtest.sh cmd "/system license print" | tee license-auto.txt
+          ./vmtest.sh stop
+          grep -aqE '(system|software)-id' license-auto.txt
+          case "${{ matrix.mode }}" in
+            chr) grep -aq 'level: p-unlimited' license-auto.txt ;;
+            x86) ! grep -aq 'expires-in' license-auto.txt ;;
+          esac
+          cp .work/serial.log serial-auto-login.log
 
       - name: Upload the serial logs
         if: always()
@@ -326,6 +366,26 @@ jobs:
           grep -aqE 'system-id' license-removable.txt
           grep -aq 'level: p-unlimited' license-removable.txt
           cp .work/serial.log serial-removable-login.log
+
+      - name: Test the auto stick
+        run: |
+          set -euo pipefail
+          ./vmtest.sh test-auto
+          cp .work/serial.log serial-auto.log
+          grep -aq 'efiboot: auto mode: looking for the first RouterOS kernel' .work/serial.log
+          grep -aq 'efiboot: auto: kernel found on' .work/serial.log
+          grep -aq 'ptrace-init' .work/serial.log
+          grep -aq 'ldpreload. loaded by' .work/serial.log
+          [ "$(grep -ac 'ldpreload. loaded by' .work/serial.log)" -ge 5 ]
+          grep -aq 'mode: licence' .work/serial.log
+          # auto mode installs nothing: the installer never runs
+          ! grep -aq 'installer mode' .work/serial.log
+          ./vmtest.sh cmd "/system license print" | tee license-auto.txt
+          ./vmtest.sh stop
+          grep -aqE 'system-id' license-auto.txt
+          grep -aq 'level: p-unlimited' license-auto.txt
+          ! grep -aq 'expires-in' license-auto.txt
+          cp .work/serial.log serial-auto-login.log
 
       - name: Upload the serial logs
         if: always()

@@ -10,6 +10,9 @@
 # disk with a FAT ESP holding the loader at the removable-media path): the
 # test boots it as a second disk together with the target image, answers the
 # install menu over the serial console, and then boots the target normally.
+# boot-auto/test-auto use bootkit-auto.img instead - both loaders and a
+# \BOOTKIT.CFG of "target=auto" - and install nothing: the loader finds the
+# target's kernel by itself.
 #
 # The source image is never modified: everything happens on $WORK/test.img.
 #
@@ -35,6 +38,14 @@
 #   ./vmtest.sh test            prepare + install + boot + wait + check
 #   ./vmtest.sh test-removable  prepare + install (mode 2) + boot-removable +
 #                               wait + check
+#   ./vmtest.sh boot-auto       boot the auto stick (bootkit-auto.img, both
+#                               loaders and \BOOTKIT.CFG = "target=auto")
+#                               with the target: the loader finds the target's
+#                               kernel and boots it; nothing is installed
+#   ./vmtest.sh test-auto       prepare + boot-auto + wait + check (builds
+#                               bootkit-auto.img, so the arm64 side - clang +
+#                               lld-link and the ARM cross compiler - is
+#                               needed as well)
 #
 # Environment:
 #   WORK=$ROOT/.work            scratch directory (image copy, logs, pidfile)
@@ -577,6 +588,32 @@ cmd_test_removable() {
     cmd_check
 }
 
+# auto mode: the both-arch stick (bootkit-auto.img, its \BOOTKIT.CFG is
+# "target=auto") scans the partitions and boots the first RouterOS kernel it
+# finds - the target's - installing nothing (no config, no files on the
+# target, no boot entry)
+cmd_boot_auto() {
+    [ -f "$IMG" ] || die "no test image, run: $0 prepare"
+    log "== building the auto stick (both loaders)"
+    (make -C "$ROOT" DEBUG="$DEBUG" bootkit-auto.img)
+    [ -f "$ROOT/bootkit-auto.img" ] || die "bootkit-auto.img not built"
+    stop_qemu
+    cp -f "$ROOT/bootkit-auto.img" "$STICK"
+    [ -f "$WORK/vars.fd" ] || cp -f "$FW_VARS" "$WORK/vars.fd"
+    : > "$SERIAL_LOG"
+    rm -f "$SERIAL_SOCK"
+    # shellcheck disable=SC2046
+    $(qemu_cmd_removable) -daemonize -pidfile "$PIDFILE"
+    log "== qemu started (auto stick, pid $(cat "$PIDFILE"))"
+}
+
+cmd_test_auto() {
+    cmd_prepare
+    cmd_boot_auto
+    cmd_wait "$WAIT" || true
+    cmd_check
+}
+
 case "${1:-}" in
     prepare) shift; cmd_prepare "$@" ;;
     iso-install) shift; cmd_iso_install "$@" ;;
@@ -588,7 +625,9 @@ case "${1:-}" in
     login)   cmd_login ;;
     cmd)     shift; cmd_cmd "$@" ;;
     stop)    cmd_stop ;;
-    test)    cmd_test ;;
+    test)   cmd_test ;;
     test-removable) cmd_test_removable ;;
+    boot-auto) cmd_boot_auto ;;
+    test-auto) cmd_test_auto ;;
     *)       sed -n '2,/^set -euo pipefail/p' "$0"; exit 1 ;;
 esac

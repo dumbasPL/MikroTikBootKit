@@ -139,6 +139,7 @@ make                              # production build:
                                   #    ptrace_init (static i386)
                                   #    bootkit.efi (EFI loader, see bootloader/)
                                   #    bootkit.img (32 MB USB stick image)
+                                  #    + the arm64 pair and bootkit-auto.img
 make DEBUG=1                      # test build: serial console + verbose logs
 make EFI_CC=x86_64-w64-mingw32-gcc  # build the loader with gcc
 ```
@@ -193,6 +194,15 @@ probe logs: production prints only the important probe lines (licence state
 and the three patches) and errors, debug=1 prints every step.  The installer
 writes the build default (`make DEBUG=1` -> `debug=1`); edit the line
 and reboot to switch without rebuilding.
+
+`target=auto` selects *auto mode* instead: no partition identity and no
+install - the loader scans the volumes and boots the first file that looks
+like the stock RouterOS kernel (x86: a bzImage setup header with the 64-bit
+EFI handover entry; arm64: the XZ stock initramfs the loader needs).  The
+loader's own file never matches those checks, so a stick with this config
+never boots itself.  `bootkit-auto.img` ships exactly that: both loaders and
+`bootloader/auto.cfg` as `\BOOTKIT.CFG`, so the same stick boots x86 and the
+arm64 CHR and leaves the router untouched (no config, no boot entry).
 
 Without a valid config it runs the install menu instead: pick the RouterOS
 ESP, then `direct` (copy the loader + config to the target, create the
@@ -257,6 +267,9 @@ image is never touched):
 ./vmtest.sh stop                 # kill the VM
 ./vmtest.sh test                 # prepare + install + boot + wait + check
 ./vmtest.sh test-removable       # same, with the removable install mode
+./vmtest.sh boot-auto            # boot the auto stick (bootkit-auto.img) + target
+./vmtest.sh test-auto            # the target booted through the auto stick
+                                 # (builds both loaders; nothing is installed)
 ```
 
 Environment knobs: `IMG_SRC` (source image, default

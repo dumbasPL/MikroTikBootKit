@@ -37,6 +37,7 @@
  */
 #include "efi.h"
 #include "boot.h"
+#include "config.h"
 #include "initrdvol.h"
 #ifndef INITRD_SO_HEADER
 #define INITRD_SO_HEADER "initrd_so.h"
@@ -172,6 +173,47 @@ static VOID print_kernel_version(const UINT8 *kbuf, UINTN klen)
 
 /* ---- boot -------------------------------------------------------------- */
 
+/* the kernel file size window this loader accepts */
+static BOOLEAN kernel_size_ok(UINT64 size)
+{
+	return size >= 1024 * 1024 && size <= 64 * 1024 * 1024;
+}
+
+/*
+ * target=auto: does \EFI\BOOT\BOOTAA64.EFI on this volume look like the
+ * stock RouterOS kernel?  It is the file carrying the stock XZ initramfs this
+ * loader needs; the loader's own file (the auto stick has it at that very
+ * path) is far too small and carries no such stream.
+ */
+static BOOLEAN kernel_probe(EFI_FILE_PROTOCOL *root)
+{
+	EFI_FILE_PROTOCOL *f;
+	EFI_STATUS status;
+	VOID *kbuf = 0;
+	UINTN klen, boff, blen;
+	UINT64 size64;
+	BOOLEAN ok;
+
+	status = open_file(root, KERNEL_PATH, &f);
+	if (EFI_ERROR(status))
+		return FALSE;
+	status = file_size(f, &size64);
+	if (EFI_ERROR(status) || !kernel_size_ok(size64)) {
+		f->Close(f);
+		return FALSE;
+	}
+	klen = (UINTN)size64;
+	if (EFI_ERROR(BS->AllocatePool(EfiLoaderData, klen, &kbuf))) {
+		f->Close(f);
+		return FALSE;
+	}
+	status = read_file(f, 0, kbuf, klen);
+	f->Close(f);
+	ok = !EFI_ERROR(status) && find_builtin_initrd(kbuf, klen, &boff, &blen);
+	BS->FreePool(kbuf);
+	return ok;
+}
+
 EFI_STATUS boot_from_root(EFI_HANDLE image, EFI_FILE_PROTOCOL *root,
 			  BOOLEAN debug)
 {
@@ -198,7 +240,7 @@ EFI_STATUS boot_from_root(EFI_HANDLE image, EFI_FILE_PROTOCOL *root,
 		return fail(status, L"cannot size the kernel");
 	}
 	klen = size64;
-	if (klen < 1024 * 1024 || klen > 64 * 1024 * 1024) {
+	if (!kernel_size_ok(klen)) {
 		f->Close(f);
 		return fail(EFI_LOAD_ERROR, L"the kernel file looks wrong");
 	}
@@ -272,4 +314,16 @@ EFI_STATUS boot_from_root(EFI_HANDLE image, EFI_FILE_PROTOCOL *root,
 	/* on success the kernel takes over and this never returns */
 	status = BS->StartImage(khandle, 0, 0);
 	return fail(status, L"the kernel did not start");
+}
+
+/* target=auto (see config.h): boot the first RouterOS kernel found */
+EFI_STATUS boot_auto(EFI_HANDLE image, BOOLEAN debug)
+{
+	EFI_FILE_PROTOCOL *root;
+	EFI_STATUS status;
+
+	status = find_kernel_root(kernel_probe, &root);
+	if (EFI_ERROR(status))
+		return status;
+	return boot_from_root(image, root, debug);
 }

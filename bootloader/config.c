@@ -1,7 +1,9 @@
 /*
  * config.c - \BOOTKIT.CFG: parse/write the target partition identity and the
  * "debug=" switch, and find the target partition among the EFI system
- * partitions.
+ * partitions.  "target=auto" (CONFIG_TARGET_AUTO) selects auto mode instead
+ * of a partition identity: find_kernel_root() then returns the first volume
+ * whose kernel the arch-specific probe accepts.
  */
 #include "efi.h"
 #include "config.h"
@@ -163,7 +165,8 @@ static BOOLEAN parse_bool(const char *s, UINTN len, BOOLEAN *out)
 	return TRUE;
 }
 
-static BOOLEAN config_parse(const char *buf, UINTN len, TARGET_ID *id, BOOLEAN *debug)
+static BOOLEAN config_parse(const char *buf, UINTN len, TARGET_ID *id,
+			    BOOLEAN *auto_mode, BOOLEAN *debug)
 {
 	BOOLEAN have_target = FALSE;
 	UINTN i = 0;
@@ -183,8 +186,15 @@ static BOOLEAN config_parse(const char *buf, UINTN len, TARGET_ID *id, BOOLEAN *
 		if (start == end || buf[start] == '#')
 			continue;
 		if (name_is(buf + start, end - start, "target")) {
-			if (parse_target_id(buf + start + 7, end - start - 7, id))
+			const char *v = buf + start + 7;
+			UINTN vlen = end - start - 7;
+
+			if (value_is(v, vlen, CONFIG_TARGET_AUTO)) {
+				*auto_mode = TRUE;
 				have_target = TRUE;
+			} else if (parse_target_id(v, vlen, id)) {
+				have_target = TRUE;
+			}
 		} else if (name_is(buf + start, end - start, "debug")) {
 			(void)parse_bool(buf + start + 6, end - start - 6, debug);
 		}
@@ -192,7 +202,8 @@ static BOOLEAN config_parse(const char *buf, UINTN len, TARGET_ID *id, BOOLEAN *
 	return have_target;
 }
 
-EFI_STATUS config_read(EFI_FILE_PROTOCOL *root, TARGET_ID *id, BOOLEAN *debug)
+EFI_STATUS config_read(EFI_FILE_PROTOCOL *root, TARGET_ID *id, BOOLEAN *auto_mode,
+		       BOOLEAN *debug)
 {
 	EFI_FILE_PROTOCOL *f;
 	EFI_STATUS status;
@@ -215,7 +226,8 @@ EFI_STATUS config_read(EFI_FILE_PROTOCOL *root, TARGET_ID *id, BOOLEAN *debug)
 		return status;
 	buf[len] = 0;
 	*debug = BOOTKIT_DEBUG_DEFAULT;
-	if (!config_parse(buf, len, id, debug))
+	*auto_mode = FALSE;
+	if (!config_parse(buf, len, id, auto_mode, debug))
 		return EFI_INVALID_PARAMETER;
 	return EFI_SUCCESS;
 }
@@ -338,6 +350,62 @@ EFI_STATUS find_target_root(const TARGET_ID *id, EFI_FILE_PROTOCOL **out)
 			continue;
 		BS->FreePool(handles);
 		return EFI_SUCCESS;
+	}
+	BS->FreePool(handles);
+	return EFI_NOT_FOUND;
+}
+
+/* "efiboot: auto: kernel found on ..." - which volume the scan picked */
+static VOID print_kernel_volume(EFI_HANDLE handle)
+{
+	EFI_DEVICE_PATH_TO_TEXT_PROTOCOL *d2t = 0;
+	EFI_DEVICE_PATH_PROTOCOL *dp = 0;
+	CHAR16 *text;
+
+	BS->LocateProtocol(&device_path_to_text_guid, 0, (VOID **)&d2t);
+	if (!d2t ||
+	    EFI_ERROR(BS->HandleProtocol(handle, &device_path_guid, (VOID **)&dp)))
+		return;
+	text = d2t->ConvertDevicePathToText(dp, FALSE, TRUE);
+	if (!text)
+		return;
+	print(L"efiboot: auto: kernel found on ");
+	print_trunc(text, 60);
+	print(L"\r\n");
+	BS->FreePool(text);
+}
+
+/*
+ * target=auto: hand every volume to the arch-specific probe and return the
+ * first one holding a bootable RouterOS kernel.  EFI_NOT_FOUND means there is
+ * none (the callers then fall back to the install menu).
+ */
+EFI_STATUS find_kernel_root(KERNEL_PROBE probe, EFI_FILE_PROTOCOL **out)
+{
+	EFI_HANDLE *handles = 0;
+	UINTN count = 0, i;
+	EFI_STATUS status;
+
+	status = BS->LocateHandleBuffer(EFI_BY_PROTOCOL, &simple_file_system_guid,
+					0, &count, &handles);
+	if (EFI_ERROR(status))
+		return status;
+	for (i = 0; i < count; i++) {
+		EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs;
+		EFI_FILE_PROTOCOL *root;
+
+		if (EFI_ERROR(BS->HandleProtocol(handles[i], &simple_file_system_guid,
+						 (VOID **)&fs)))
+			continue;
+		if (EFI_ERROR(fs->OpenVolume(fs, &root)))
+			continue;
+		if (probe(root)) {
+			print_kernel_volume(handles[i]);
+			BS->FreePool(handles);
+			*out = root;
+			return EFI_SUCCESS;
+		}
+		root->Close(root);
 	}
 	BS->FreePool(handles);
 	return EFI_NOT_FOUND;

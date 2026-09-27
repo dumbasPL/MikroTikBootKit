@@ -1,10 +1,12 @@
 # MikroTikBootKit build
 #
 #   make             build both architectures: the x86_64 pair (ptrace_init,
-#                    bootkit.efi, bootkit.img) and the arm64 CHR pair
-#                    (ptrace_init-arm, bootkit-arm64.efi, bootkit-arm64.img);
-#                    arm64 is skipped with a warning when clang + lld-link or
-#                    the ARM cross compiler are not installed
+#                    bootkit.efi, bootkit.img), the arm64 CHR pair
+#                    (ptrace_init-arm, bootkit-arm64.efi, bootkit-arm64.img)
+#                    and bootkit-auto.img (both loaders + a target=auto
+#                    \BOOTKIT.CFG); arm64 and bootkit-auto.img are skipped
+#                    with a warning when clang + lld-link or the ARM cross
+#                    compiler are not installed
 #   make x86         only the x86_64 pair
 #   make arm64       only the arm64 CHR pair
 #   make clean       remove the generated artifacts and .build/
@@ -109,7 +111,7 @@ endif
 
 all: x86
 ifeq ($(ARM64_HOST_OK),1)
-all: arm64
+all: arm64 bootkit-auto.img
 else
 all: arm64-skip
 endif
@@ -123,7 +125,8 @@ arm64-skip:
 
 clean:
 	rm -f $(OUT) ptrace_init-arm bootkit.efi bootkit-arm64.efi \
-	    bootkit.img bootkit-arm64.img initrd.cpio initrd-arm.cpio \
+	    bootkit.img bootkit-arm64.img bootkit-auto.img \
+	    initrd.cpio initrd-arm.cpio \
 	    bootkit/preload.so bootkit/preload-arm.so \
 	    bootkit/preload_so.h bootkit/preload_so_arm.h \
 	    bootloader/initrd_so.h bootloader/initrd_so_arm.h
@@ -306,5 +309,20 @@ bootkit-arm64.efi: $(ARM64_EFI_SRCS) $(LOADER_HDRS) bootloader/initrd_so_arm.h $
 #    path) holding the loader.
 bootkit-arm64.img: bootkit-arm64.efi $(TOOLS)/bootkit_img.sh $(TOOLS)/mbr.py $(IMGFLAGS)
 	USB_MB=$(USB_MB) $(TOOLS)/bootkit_img.sh $@ BKINSTALL64 0x4d544b43 bootkit-arm64.efi EFI/BOOT/BOOTAA64.EFI
+
+# ------------------------------------------------------------ both (auto)
+
+# bootkit-auto.img: the both-arch stick - \EFI\BOOT\BOOTX64.EFI and
+# \EFI\BOOT\BOOTAA64.EFI plus \BOOTKIT.CFG with "target=auto"
+# (bootloader/auto.cfg).  The firmware picks the loader for its own
+# architecture and that loader scans the partitions and boots the first
+# RouterOS kernel it finds; nothing is installed and nothing on the router is
+# touched (no config, no boot entry).
+bootkit-auto.img: bootkit.efi bootkit-arm64.efi bootloader/auto.cfg \
+		$(TOOLS)/bootkit_img.sh $(TOOLS)/mbr.py $(IMGFLAGS) | check-efi-cc check-arm64
+	USB_MB=$(USB_MB) $(TOOLS)/bootkit_img.sh $@ BKAUTO 0x4d544b44 \
+	    bootkit.efi EFI/BOOT/BOOTX64.EFI \
+	    bootkit-arm64.efi EFI/BOOT/BOOTAA64.EFI \
+	    bootloader/auto.cfg BOOTKIT.CFG
 
 FORCE:

@@ -240,7 +240,8 @@ RouterOS processes it is preloaded into.
 ## Test
 
 Needs: KVM (the default accelerator on x86_64; use `ACCEL=tcg` where there is
-no `/dev/kvm`, e.g. hosted CI runners), `clang` + `lld` (or
+no `/dev/kvm`.  The hosted CI runners expose `/dev/kvm` to root only, so
+`test.yml` chmods it for the runner user before probing), `clang` + `lld` (or
 `x86_64-w64-mingw32-gcc` for the x86 loader only), OVMF (Arch's `edk2-ovmf` or
 Debian/Ubuntu's `ovmf` - the paths are found automatically and
 `OVMF_CODE`/`OVMF_VARS` override), `mtools` (`mformat`/`mmd`/`mcopy` also
@@ -351,11 +352,13 @@ x86 job, plus an arm64 job on the stock CHR `*.img.zip`: it caches the
 i386/arm musl toolchains and the installer ISO / CHR image, installs the clean
 image once per job and then runs the direct and the removable test with
 loader/tracer/probe and licence assertions.
-GitHub-hosted runners have no usable KVM, so the workflow probes it and falls
-back to `ACCEL=tcg` with a longer `WAIT`.  The RouterOS version is resolved
-first from `upgrade.mikrotik.com` (`NEWESTa7.<channel>`, the endpoint the
-routers use): the newest release on the `ROUTEROS_CHANNEL` repository variable
-(default `stable`), or an explicit `version` input when dispatching.
+The workflow probes the QEMU accelerator and falls back to `ACCEL=tcg` with a
+longer `WAIT` where KVM is not usable; `/dev/kvm` is root-only on the hosted
+runners, so the probe step chmods it for the runner user first.  The RouterOS
+version is resolved first from `upgrade.mikrotik.com` (`NEWESTa7.<channel>`,
+the endpoint the routers use): the newest release on the `ROUTEROS_CHANNEL`
+repository variable (default `stable`), or an explicit `version` input when
+dispatching.
 `.github/workflows/daily.yml` calls the test workflow once a day on that latest
 version.
 

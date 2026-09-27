@@ -24,11 +24,12 @@ name: Test
 # and checks the same lines and the p-unlimited licence; the CHR arm64
 # userspace is AArch32, so the probe and the tracer are built as arm32.
 #
-# GitHub-hosted runners have no usable KVM, so the QEMU accelerator is probed
-# and falls back to emulation (TCG); a self-hosted runner with /dev/kvm uses
-# KVM and runs much faster.  The arm64 job always emulates (TCG + cortex-a72:
-# the CHR arm64 kernel hangs with -cpu max).  daily.yml calls this workflow
-# once a day.
+# The QEMU accelerator is probed: the hosted runners do expose /dev/kvm but
+# only to root, so the probe step chmods it for the runner user and uses KVM
+# when it works, falling back to emulation (TCG) otherwise.  The arm64 job
+# always emulates (TCG + cortex-a72: the CHR arm64 kernel hangs with -cpu max,
+# and an x86 host cannot run an aarch64 guest under KVM anyway).  daily.yml
+# calls this workflow once a day.
 
 on:
   push:
@@ -202,6 +203,10 @@ jobs:
       - name: Pick the QEMU accelerator
         run: |
           set -uo pipefail
+          # /dev/kvm is root-only on the hosted runners; hand it to the runner
+          # user so QEMU runs with KVM instead of falling back to TCG.  The
+          # probe below still decides - it also needs working nested virt.
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
           accel=tcg
           if [ -w /dev/kvm ]; then
             rc=0

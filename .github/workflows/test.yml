@@ -160,9 +160,13 @@ jobs:
             .toolchain/arm-musl
           key: musl-arm-${{ runner.os }}-${{ hashFiles('tools/musl_arm.sh') }}
 
-      # The MikroTik CDN is slow from the runners and the ISO never changes.
-      - name: Cache the installer ISO
-        uses: actions/cache@v4
+      # The MikroTik CDN is slow from the runners (the 68 MB ISO crawls at
+      # ~400 kB/s and readily resets the connection) and the ISO never changes,
+      # so cache it and save it as soon as the download is done instead of at
+      # the end of the job.
+      - name: Restore the installer ISO
+        id: iso-cache
+        uses: actions/cache/restore@v4
         with:
           path: .work/mikrotik-${{ env.ROUTEROS_VERSION }}.iso
           key: routeros-iso-${{ runner.os }}-${{ env.ROUTEROS_VERSION }}
@@ -171,15 +175,29 @@ jobs:
         run: |
           set -euo pipefail
           iso=".work/mikrotik-$ROUTEROS_VERSION.iso"
-          if [ ! -f "$iso" ]; then
+          # -s: an empty file (a cache entry that did not restore) is a miss
+          if [ ! -s "$iso" ]; then
             mkdir -p .work
             url="https://download.mikrotik.com/routeros/$ROUTEROS_VERSION/mikrotik-$ROUTEROS_VERSION.iso"
             echo "downloading $url"
-            curl -fL --retry 3 -o "$iso.part" "$url"
+            # http1.1: the CDN's HTTP/2 resets mid-transfer; --retry-all-errors
+            # retries the reset (56) too and -C - resumes from the partial file
+            # instead of starting the slow download over
+            curl -fL --http1.1 --retry 3 --retry-all-errors -C - -o "$iso.part" "$url"
             mv "$iso.part" "$iso"
+          else
+            echo "using the cached ISO"
           fi
           ls -l "$iso"
           sha256sum "$iso" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cache the installer ISO
+        if: steps.iso-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .work/mikrotik-${{ env.ROUTEROS_VERSION }}.iso
+          key: routeros-iso-${{ runner.os }}-${{ env.ROUTEROS_VERSION }}
 
       - name: Pick the QEMU accelerator
         run: |
@@ -309,9 +327,11 @@ jobs:
             .toolchain/arm-musl
           key: musl-arm-${{ runner.os }}-${{ hashFiles('tools/musl_arm.sh') }}
 
-      # The CHR arm64 image is only distributed as a zip and never changes.
-      - name: Cache the arm64 CHR image
-        uses: actions/cache@v4
+      # The CHR arm64 image is only distributed as a zip and never changes, so
+      # cache it and save it as soon as the download is done.
+      - name: Restore the arm64 CHR image
+        id: chr-cache
+        uses: actions/cache/restore@v4
         with:
           path: .work/chr-${{ env.ROUTEROS_VERSION }}-arm64.img.zip
           key: routeros-chr-arm64-${{ runner.os }}-${{ env.ROUTEROS_VERSION }}
@@ -320,15 +340,28 @@ jobs:
         run: |
           set -euo pipefail
           zip=".work/chr-$ROUTEROS_VERSION-arm64.img.zip"
-          if [ ! -f "$zip" ]; then
+          # -s: an empty file (a cache entry that did not restore) is a miss
+          if [ ! -s "$zip" ]; then
             mkdir -p .work
             url="https://download.mikrotik.com/routeros/$ROUTEROS_VERSION/chr-$ROUTEROS_VERSION-arm64.img.zip"
             echo "downloading $url"
-            curl -fL --retry 3 -o "$zip.part" "$url"
+            # http1.1 + resume, same as the ISO above: the CDN is slow and
+            # drops connections mid-transfer
+            curl -fL --http1.1 --retry 3 --retry-all-errors -C - -o "$zip.part" "$url"
             mv "$zip.part" "$zip"
+          else
+            echo "using the cached CHR image"
           fi
           ls -l "$zip"
           sha256sum "$zip" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cache the arm64 CHR image
+        if: steps.chr-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .work/chr-${{ env.ROUTEROS_VERSION }}-arm64.img.zip
+          key: routeros-chr-arm64-${{ runner.os }}-${{ env.ROUTEROS_VERSION }}
 
       - name: Install a clean image and test the direct install
         run: |

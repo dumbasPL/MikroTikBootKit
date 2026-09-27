@@ -3,6 +3,8 @@
 MikroTik RouterOS (x86 (CHR and bare metal), arm64 CHR) BootKit that that patches a stock RouterOS
 install on the fly to activate it. No binaries are modified, updates work as expected.
 
+EFI only!
+
 ## Download
 
 Grab the stick image for your target from the

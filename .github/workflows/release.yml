@@ -1,0 +1,56 @@
+name: Release
+
+# Builds the boot kit and attaches it to a published release: the three USB
+# stick images (x86, arm64 and the both-arch auto stick) and the two EFI
+# loaders.  The build is the same `make` the test workflow exercises, without
+# the VMs.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Attach the built artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # build-essential first: the multilib package below is named for the
+          # gcc it brings in (gcc -dumpversion)
+          sudo apt-get install -y --no-install-recommends build-essential
+          # not gcc-multilib: that metapackage Conflicts: gcc-arm-linux-gnueabihf
+          # and the build needs both compilers (gcc -m32 for the i386 musl
+          # toolchain, the cross gcc for the arm32 one).  The versioned multilib
+          # package carries the same 32-bit x86 support without the conflict.
+          sudo apt-get install -y --no-install-recommends \
+            "gcc-$(gcc -dumpversion)-multilib" libc6-dev-i386 \
+            clang lld gcc-arm-linux-gnueabihf \
+            mtools cpio
+
+      - name: Build the kit
+        run: make
+
+      - name: Attach the artifacts to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          files=(
+            bootkit.efi bootkit-arm64.efi
+            bootkit.img bootkit-arm64.img bootkit-auto.img
+          )
+          ls -l "${files[@]}"
+          sha256sum "${files[@]}" >> "$GITHUB_STEP_SUMMARY"
+          # --clobber: a re-run replaces the assets instead of failing on them
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "${files[@]}" --clobber

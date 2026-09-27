@@ -144,6 +144,9 @@ vmconsole.py                serial-console helper used by vmtest.sh cmd and the
                             tests on CHR and x86, plus arm64 (TCG on hosted
                             runners)
 .github/workflows/daily.yml daily call of test.yml on the latest RouterOS
+.github/workflows/release.yml
+                            builds the kit on a published release and attaches
+                            the two loaders and the three stick images to it
 docs/ptrace-init-preload.md design + findings + verified log
 ```
 

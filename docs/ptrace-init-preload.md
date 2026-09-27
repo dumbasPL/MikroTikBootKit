@@ -26,7 +26,7 @@ stub (the reference tool's trick) so the loader's verifier accepts the custom
 signature.  See
 [Runtime licence: keygen + key patches](#runtime-licence-keygen--key-patches).
 
-Source: `bootkit/ptrace_init.c` (build: `./build.sh`).  Part of MikroTikBootKit.
+Source: `bootkit/ptrace_init.c` (build: `make`).  Part of MikroTikBootKit.
 
 ## How it works
 
@@ -53,8 +53,8 @@ service, and the bind keeps the rootfs backing that makes it mappable on
 The probe (`bootkit/preload.c`) is a plain i386 shared object built without libc
 (`-nostdlib`): no `DT_NEEDED`, the imports (`open`/`write`/`readlink`/
 `getpid`/`snprintf`/...) are resolved at load time by the dynamic linker
-against the libc already in the process (RouterOS `/lib/libc.so`).  `build.sh`
-embeds it in the init binary as a C array.  Its ELF constructor reads
+against the libc already in the process (RouterOS `/lib/libc.so`).  The
+`Makefile` embeds it in the init binary as a C array.  Its ELF constructor reads
 `/proc/self/exe` and writes `[ldpreload] loaded by <path> (pid=<n>)` to
 `/dev/console`; for `mode`, `keyman` and `loader` it additionally patches the
 licence (keygen, public key, memcmp GOT), see
@@ -135,19 +135,19 @@ load on 7.24.4, which is why the bind-mount route replaced it.
 Build:
 
 ```sh
-./build.sh                        # production build:
+make                              # production build:
                                   #    ptrace_init (static i386)
                                   #    bootkit.efi (EFI loader, see bootloader/)
                                   #    bootkit.img (32 MB USB stick image)
-DEBUG=1 ./build.sh                # test build: serial console + verbose logs
-EFI_CC=x86_64-w64-mingw32-gcc ./build.sh   # build the loader with gcc
+make DEBUG=1                      # test build: serial console + verbose logs
+make EFI_CC=x86_64-w64-mingw32-gcc  # build the loader with gcc
 ```
 
 The i386 binary is always built against musl; when `.toolchain/i386-musl` is
-missing, `build.sh` runs `tools/musl_i386.sh` (multilib host gcc + network)
-by itself.
+missing (or `tools/musl_i386.sh` changed), `make` runs `tools/musl_i386.sh`
+(multilib host gcc + network) by itself.
 
-Install: `./build.sh` packs the binary into a cpio and embeds that in the EFI
+Install: `make` packs the binary into a cpio and embeds that in the EFI
 loader (`bootkit.efi`), which boots it with `rdinit=/ptrace_init`.  The stock
 initramfs is not modified - `/init` stays the real init, which the wrapper
 execs unchanged.  `bootkit.img` is an MBR disk with one FAT EFI system
@@ -191,7 +191,7 @@ controls the serial console (`console=ttyS0,115200n8` is appended to the
 kernel command line only with `debug=1`) and the verbosity of the tracer and
 probe logs: production prints only the important probe lines (licence state
 and the three patches) and errors, debug=1 prints every step.  The installer
-writes the build default (`DEBUG=1 ./build.sh` -> `debug=1`); edit the line
+writes the build default (`make DEBUG=1` -> `debug=1`); edit the line
 and reboot to switch without rebuilding.
 
 Without a valid config it runs the install menu instead: pick the RouterOS
@@ -227,7 +227,7 @@ The one-time install run adds the installer stick as a second USB drive
 (`vmtest.sh install` does all of it).  For the removable boot phase both disks
 are attached with `bootindex=0` on the stick so OVMF starts it first.
 
-Rebuild loop: `./build.sh` (it re-packs `ptrace_init` and re-embeds it in
+Rebuild loop: `make x86` (it re-packs `ptrace_init` and re-embeds it in
 `bootkit.efi`), `mcopy` `bootkit.efi` over `::/EFI/BOOT/BOOTKIT.EFI` (the
 config, boot entry and kernel stay untouched), boot, then check the serial log
 for the `[ptrace-init]` and `[ldpreload]` lines and for `CHR Login:`.  To see

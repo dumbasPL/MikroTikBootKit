@@ -7,8 +7,8 @@ Boot-time tooling for MikroTik RouterOS images.  Two pieces:
   the EFI shell + `startup.nsh` trick the kit used before: it reads the stock
   kernel from `\EFI\BOOT\BOOTX64.EFI` (left in place there, so a RouterOS
   update overwrites it with the new kernel and the loader picks that up) and
-  carries the initramfs (a cpio with `ptrace_init`, built and embedded by
-  `build.sh`) inside the loader image, then enters the kernel through the x86
+  carries the initramfs (a cpio with `ptrace_init`, built and embedded by the
+  `Makefile`) inside the loader image, then enters the kernel through the x86
   EFI handover protocol with a `struct boot_params` it fills in.  The entry
   point is the kernel's own EFI stub, so the EFI runtime environment the init
   expects is preserved.  Built with clang (`--target=x86_64-unknown-windows`,
@@ -53,7 +53,7 @@ Boot-time tooling for MikroTik RouterOS images.  Two pieces:
   (armv7, soft-float), so the probe and the tracer are arm32 binaries; see
   `bootkit/` below.
 
-  `DEBUG=1 ./build.sh` makes this a *test build*: new configs get
+  `make DEBUG=1` makes this a *test build*: new configs get
   `debug=1`, which adds the serial console to the x86 kernel command line
   (`console=ttyS0,115200n8 bootkit_debug=1`; on arm64 the base line already
   carries `console=ttyAMA0,115200n8`, so only `bootkit_debug=1` is added) and
@@ -107,10 +107,15 @@ bootloader/                 the EFI-side loaders (-> \EFI\BOOT\BOOTKIT.EFI)
   vars.c                    Boot#### creation and BootOrder update
   installer.c               install menu (direct / removable)
 tools/musl_i386.sh          builds the local i486-musl toolchain (downloads
-                            and compiles musl; picked up by build.sh)
+                            and compiles musl; picked up by the Makefile)
 tools/musl_arm.sh           builds the armv7-musl toolchain for the arm64 CHR
                             (needs a host arm-linux-gnueabihf-gcc)
-build.sh                    builds both kits, both loaders and both sticks
+tools/embed.py              writes a binary as a C array header (the probe into
+                            ptrace_init, the cpio into the EFI loaders)
+tools/mkinitrd.sh           packs ptrace_init as the cpio/newc initramfs
+tools/bootkit_img.sh        builds a bootkit*.img USB stick (MBR + FAT ESP)
+tools/mbr.py                writes the stick MBR (partition + fixed signature)
+Makefile                    builds both kits, both loaders and both sticks
 vmtest.sh                   prepare/install/boot/interact with a test image copy,
                             install a clean image from an installer ISO (x86) or
                             unpack a CHR *.img.zip (arm64)
@@ -126,7 +131,7 @@ docs/ptrace-init-preload.md design + findings + verified log
 ## Build
 
 ```sh
-./build.sh                  # production build of both architectures:
+make                        # production build of both architectures:
                             #   ./ptrace_init      static i386, ~90 KB with the probe
                             #   ./bootkit.efi      x86_64 EFI app, ~110 KB with the
                             #                      embedded initramfs
@@ -134,11 +139,16 @@ docs/ptrace-init-preload.md design + findings + verified log
                             #   ./ptrace_init-arm  static arm32 (armv7) for the CHR arm64
                             #   ./bootkit-arm64.efi  AArch64 EFI app
                             #   ./bootkit-arm64.img  32 MB arm64 USB stick image
-ARCH=x86 ./build.sh         # only the x86_64 pair (no arm toolchain needed)
-ARCH=arm64 ./build.sh       # only the arm64 pair (needs clang; the arm musl
+make x86                    # only the x86_64 pair (no arm toolchain needed)
+make arm64                  # only the arm64 pair (needs clang; the arm musl
                             # toolchain is built automatically)
-DEBUG=1 ./build.sh          # test build: serial console + verbose logs
+make DEBUG=1                # test build: serial console + verbose logs
+make clean                  # remove the generated artifacts and .build/
 ```
+
+`make` skips arm64 with a warning when clang + lld-link or the ARM cross
+compiler are not installed; `make arm64` fails in that case.  The other build
+variables are `EFI_CC=` (x86 loader compiler), `ARM_CC=`, `USB_MB=` and `OUT=`.
 
 `bootkit.img` / `bootkit-arm64.img` are 32 MB MBR disks with one FAT EFI
 system partition (type 0xEF, labels `BKINSTALL` / `BKINSTALL64`) holding
@@ -156,15 +166,15 @@ loader starts its direct/removable install menu; a removable install writes
 the config to the same FAT partition, after which the stick can boot RouterOS
 without touching the router's NVRAM.
 
-The EFI loader is built by the same script; it defines the small EFI subset it
-needs itself (`-nostdlib`, no gnu-efi), so apart from the usual build tools
+The EFI loader is built by the same Makefile; it defines the small EFI subset
+it needs itself (`-nostdlib`, no gnu-efi), so apart from the usual build tools
 (`python3`, `cpio`, `mtools`) only an EFI-capable compiler is needed: clang +
 lld-link (preferred), or a gcc that targets PE such as
-`x86_64-w64-mingw32-gcc` (`EFI_CC=x86_64-w64-mingw32-gcc ./build.sh`; the
-script picks it automatically when clang is missing).  Native Linux gcc cannot
+`x86_64-w64-mingw32-gcc` (`make EFI_CC=x86_64-w64-mingw32-gcc`; the Makefile
+picks it automatically when clang is missing).  Native Linux gcc cannot
 produce the relocatable PE by itself - that needs a PE linker or gnu-efi's
 self-relocator.
-The script packs the freshly built `ptrace_init` into a cpio (`initrd.cpio`,
+The build packs the freshly built `ptrace_init` into a cpio (`initrd.cpio`,
 embedded via the generated `bootloader/initrd_so.h`), so `bootkit.efi` is
 self-contained: only the stock kernel sits next to it on the ESP, plus the
 `Boot####` entry that points at the loader.  The kernel path and the base/debug
@@ -190,9 +200,9 @@ variables `CUSTOM_LICENSE_PUBLIC_KEY` / `CUSTOM_LICENSE_PRIVATE_KEY` (the
 pair) and `MIKRO_LICENSE_PUBLIC_KEY` (the stock key) override it at build
 time.
 
-The init binaries are always built against musl: `build.sh` uses the local
-`.toolchain/i386-musl` and `.toolchain/arm-musl`, and if one is missing it
-runs `tools/musl_i386.sh` / `tools/musl_arm.sh` itself (the i386 one needs a
+The init binaries are always built against musl: `make` uses the local
+`.toolchain/i386-musl` and `.toolchain/arm-musl`, and if one is missing or its
+`tools/musl_*.sh` changed it runs that script again (the i386 one needs a
 multilib host gcc -m32, the arm one a host `arm-linux-gnueabihf-gcc`; both
 fetch musl if it is not cached).  They are static, so they run in the
 initramfs with no libraries.  The arm32 probe is built soft-float with the
@@ -236,7 +246,7 @@ tracer/probe output only appears after flipping `debug=1` in the config:
 
 ```sh
 # 1. build (ptrace_init, the initramfs and the loader with it embedded)
-./build.sh
+make
 
 # 2. test image: copy, make it CHR mode (no licence needed); nothing is added
 #    to its ESP - the installer does that
@@ -244,7 +254,7 @@ IMG=./.work/pb-test.img         # clone of the clean x86 image (on real disk)
 cp ../x86-7.23.7-clean.img $IMG
 printf '\001' | dd of=$IMG bs=1 seek=$((0x150)) conv=notrunc status=none   # MBR mode flag -> CHR
 
-# 3. USB boot image: ./build.sh already made bootkit.img (32 MB MBR disk with
+# 3. USB boot image: make already made bootkit.img (32 MB MBR disk with
 #    a FAT ESP holding \EFI\BOOT\BOOTX64.EFI).  ./vmtest.sh prepare copies it
 #    to the scratch dir and uses it as the installer stick.
 cp bootkit.img /tmp/stick.img

@@ -8,12 +8,12 @@
 #                     it is our own PID 1 and runs no floating-point code)
 #   preload.so        built separately with -mfloat-abi=soft -nostdlib, so it
 #                     matches the soft-float RouterOS processes it is loaded
-#                     into (see build.sh)
+#                     into (see the Makefile)
 #
 # musl compiles its own libc, so the only requirements are a host cross
 # compiler that targets arm-linux-gnueabihf (Debian/Ubuntu:
 # gcc-arm-linux-gnueabihf) plus ar/ranlib.  The result is installed under
-# .toolchain/arm-musl and picked up automatically by build.sh.
+# .toolchain/arm-musl and picked up automatically by the Makefile.
 #
 # Usage: tools/musl_arm.sh [musl-version]      (default 1.2.6)
 set -e
@@ -34,14 +34,20 @@ mkdir -p "$CACHE"
 TARBALL="$CACHE/musl-$VERSION.tar.gz"
 if [ ! -f "$TARBALL" ]; then
     echo "==> downloading musl-$VERSION"
+    # download to a unique name and rename into place, so concurrent builds
+    # (e.g. make -j bootstrapping both toolchains) cannot corrupt the cache
+    TMP="$TARBALL.$$"
+    trap 'rm -f "$TMP"' EXIT
     if command -v wget >/dev/null 2>&1; then
-        wget -nv -O "$TARBALL" "https://musl.libc.org/releases/musl-$VERSION.tar.gz"
+        wget -nv -O "$TMP" "https://musl.libc.org/releases/musl-$VERSION.tar.gz"
     elif command -v curl >/dev/null 2>&1; then
-        curl -fL -o "$TARBALL" "https://musl.libc.org/releases/musl-$VERSION.tar.gz"
+        curl -fL -o "$TMP" "https://musl.libc.org/releases/musl-$VERSION.tar.gz"
     else
         echo "ERROR: neither wget nor curl available to download musl" >&2
         exit 1
     fi
+    mv -f "$TMP" "$TARBALL"
+    trap - EXIT
 fi
 
 rm -rf "$SRC" "$PREFIX"

@@ -1,7 +1,7 @@
 /*
  * preload.c - LD_PRELOAD probe for RouterOS (i386)
  *
- * Ordinary C, but linked without libc (-nostdlib, see build.sh): the shared
+ * Ordinary C, but linked without libc (-nostdlib, see the Makefile): the shared
  * object has no DT_NEEDED entry and leaves open/write/readlink/getpid/
  * snprintf/strlen/... undefined, so the dynamic linker binds them to the libc
  * already present in the process (RouterOS's /lib/libc.so) when the library
@@ -46,9 +46,9 @@
  *
  * The key pair is hard-coded in keygen.c and can be overridden at build time
  * (-DKEYGEN_LICENSE_*, from CUSTOM_LICENSE_PUBLIC_KEY /
- * CUSTOM_LICENSE_PRIVATE_KEY in build.sh's environment); signing and patching
+ * CUSTOM_LICENSE_PRIVATE_KEY in the build environment); signing and patching
  * use the same pair, so the licence this probe signs verifies against the key
- * it patches in.  Build by build.sh into preload.so;
+ * it patches in.  Built by the Makefile into preload.so;
  * embedded in ptrace_init.
  */
 
@@ -59,7 +59,7 @@
  * the generation role (no CLI, no mode2 hand-over, no
  * exit()); its kg_generate()/kg_error() are called below.  The licence key
  * pair is selected with -DKEYGEN_LICENSE_PUBLIC_HEX /
- * -DKEYGEN_LICENSE_PRIVATE_HEX (see build.sh).
+ * -DKEYGEN_LICENSE_PRIVATE_HEX (see the Makefile).
  */
 #include "keygen.c"
 
@@ -88,7 +88,7 @@ static int verbose_log(void)
 	return v;
 }
 
-/* The stock RouterOS licence public key; build.sh can override it with
+/* The stock RouterOS licence public key; the Makefile can override it with
  * -DSTOCK_LICENSE_PUBLIC_HEX from MIKRO_LICENSE_PUBLIC_KEY. */
 #ifndef STOCK_LICENSE_PUBLIC_HEX
 #define STOCK_LICENSE_PUBLIC_HEX \

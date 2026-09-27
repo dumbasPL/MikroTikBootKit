@@ -15,4 +15,5 @@
 *.img
 *.iso
 /.toolchain/
+/.build/
 /.work/

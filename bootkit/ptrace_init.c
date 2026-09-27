@@ -27,11 +27,11 @@
  * bootloader's debug= setting (\BOOTKIT.CFG): it adds bootkit_debug=1 to the
  * kernel command line and console=ttyS0,115200n8.  Production (debug=0)
  * prints only errors here and only the important licence/patch lines in the
- * probe; debug=1 prints every step.  DEBUG=1 ./build.sh sets the default for
+ * probe; debug=1 prints every step.  A DEBUG=1 build sets the default for
  * newly installed configs.
  *
  * Details, and the target behaviours this relies on: docs/ptrace-init-preload.md
- * Build: ./build.sh      (DEBUG=1 for a test build)
+ * Build: make            (make DEBUG=1 for a test build)
  */
 
 #define _GNU_SOURCE
@@ -55,7 +55,7 @@ extern char **environ;
 
 static int stash_fd = -1;
 
-/* the LD_PRELOAD probe (preload.c), embedded by build.sh */
+/* the LD_PRELOAD probe (preload.c), embedded by the Makefile */
 #ifndef PRELOAD_SO_HEADER
 #define PRELOAD_SO_HEADER "preload_so.h"
 #endif

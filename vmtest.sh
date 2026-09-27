@@ -421,7 +421,7 @@ cmd_prepare() {
     log "== building bootkit"
     local build_arch=x86
     [ "$ARCH" = arm64 ] && build_arch=arm64
-    (cd "$ROOT" && DEBUG="$DEBUG" ARCH="$build_arch" ./build.sh)
+    (make -C "$ROOT" DEBUG="$DEBUG" "$build_arch")
 
     mkdir -p "$WORK"
     log "== copying image ($IMG_SRC -> $IMG)"
@@ -437,7 +437,7 @@ cmd_prepare() {
         *)    die "MODE must be chr, x86 or keep" ;;
     esac
 
-    [ -f "$STICK_IMG" ] || die "$STICK_IMG not found (build it with ARCH=arm64/x86 ./build.sh)"
+    [ -f "$STICK_IMG" ] || die "$STICK_IMG not found (build it with make x86 or make arm64)"
     log "== using the boot image ($STICK_IMG -> $STICK)"
     export MTOOLS_SKIP_CHECK=1
     cp -f "$STICK_IMG" "$STICK"

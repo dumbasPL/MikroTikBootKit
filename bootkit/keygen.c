@@ -16,7 +16,7 @@
  *   -DKEYGEN_LICENSE_PUBLIC_HEX='"<32-byte x, hex>"'
  *   -DKEYGEN_LICENSE_PRIVATE_HEX='"<32-byte scalar, hex>"'
  *
- * build.sh passes these from the CUSTOM_LICENSE_PUBLIC_KEY /
+ * The Makefile passes these from the CUSTOM_LICENSE_PUBLIC_KEY /
  * CUSTOM_LICENSE_PRIVATE_KEY environment variables when they are set.
  *
  * Runtime environment overrides (useful for testing on a normal Linux box):

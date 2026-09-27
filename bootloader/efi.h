@@ -23,7 +23,7 @@ typedef void			VOID;
 
 /*
  * Boot-time debug logging and serial console (see \BOOTKIT.CFG "debug=").
- * DEBUG=1 ./build.sh changes the default for newly written configs and for
+ * A DEBUG=1 build changes the default for newly written configs and for
  * boots with a config that has no debug= line; production builds leave it 0.
  */
 #ifndef BOOTKIT_DEBUG_DEFAULT

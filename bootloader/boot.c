@@ -7,8 +7,8 @@
 #include "efi.h"
 #include "bootabi.h"
 #include "boot.h"
-/* the embedded initramfs (build.sh writes the x86 one as initrd_so.h and the
- * arm64 one as initrd_so_arm.h; each loader is built with the matching
+/* the embedded initramfs (the Makefile writes the x86 one as initrd_so.h and
+ * the arm64 one as initrd_so_arm.h; each loader is built with the matching
  * -DINITRD_SO_HEADER) */
 #ifndef INITRD_SO_HEADER
 #define INITRD_SO_HEADER "initrd_so.h"
@@ -17,7 +17,7 @@
 
 /* compile-time configuration; the serial console and the verbose tracer/probe
  * logs are enabled by "debug=1" in \BOOTKIT.CFG (default BOOTKIT_DEBUG_DEFAULT,
- * set by DEBUG=1 ./build.sh) */
+ * set by a DEBUG=1 build) */
 #define KERNEL_PATH		L"\\EFI\\BOOT\\BOOTX64.EFI"
 #define KERNEL_CMDLINE_BASE	"rdinit=/ptrace_init"
 #define KERNEL_CMDLINE_DEBUG	" console=ttyS0,115200n8 bootkit_debug=1"

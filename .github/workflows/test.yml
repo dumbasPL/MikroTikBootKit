@@ -129,9 +129,17 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
+          # build-essential first: the multilib package below is named for the
+          # gcc it brings in (gcc -dumpversion)
+          sudo apt-get install -y --no-install-recommends build-essential
+          # not gcc-multilib: that metapackage Conflicts: gcc-arm-linux-gnueabihf
+          # (and the cross gcc conflicts back), and this job needs both
+          # compilers - gcc -m32 for the i386 musl toolchain and the cross gcc
+          # for the arm side of bootkit-auto.img.  The versioned multilib
+          # package carries the same 32-bit x86 support without the conflict.
           sudo apt-get install -y --no-install-recommends \
-            build-essential gcc-multilib libc6-dev-i386 clang lld \
-            gcc-arm-linux-gnueabihf \
+            "gcc-$(gcc -dumpversion)-multilib" libc6-dev-i386 \
+            clang lld gcc-arm-linux-gnueabihf \
             qemu-system-x86 ovmf mtools genisoimage cpio
 
       - name: Cache the i386 musl toolchain
@@ -279,8 +287,18 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
+          # build-essential first: the multilib package below is named for the
+          # gcc it brings in (gcc -dumpversion)
+          sudo apt-get install -y --no-install-recommends build-essential
+          # not gcc-multilib: that metapackage Conflicts: gcc-arm-linux-gnueabihf
+          # (and the cross gcc conflicts back), and this job needs both
+          # compilers - gcc -m32 for the i386 side of bootkit-auto.img
+          # (test-auto) and the cross gcc for the arm64 CHR's arm32 probe.
+          # The versioned multilib package carries the same 32-bit x86 support
+          # without the conflict.
           sudo apt-get install -y --no-install-recommends \
-            build-essential gcc-arm-linux-gnueabihf clang lld \
+            "gcc-$(gcc -dumpversion)-multilib" libc6-dev-i386 \
+            clang lld gcc-arm-linux-gnueabihf \
             qemu-system-arm qemu-efi-aarch64 mtools cpio unzip
 
       - name: Cache the arm musl toolchain

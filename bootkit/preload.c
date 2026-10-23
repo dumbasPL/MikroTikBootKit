@@ -36,10 +36,12 @@
  *              immediates in .text; the compiler may emit them in any order
  *              (7.25 swaps chunks 5 and 6), so the eight chunks are matched
  *              as a set inside a small window
- *   arm32      seven words sit in a .text literal pool (order 4,5,2,0,1,6,7)
- *              and the fourth is computed from the third with three `add`
- *              immediates; the pool and the add sequence are rewritten (the
- *              arm64 CHR's userspace is AArch32, built as armv7 soft-float)
+ *   arm32      most of the key sits in a .text literal pool and the missing
+ *              word is derived by an add/sub sequence; both the pool order and
+ *              the instruction sequence are compiler output, so the words are
+ *              matched as a set and the derived word is located by its
+ *              arithmetic (the arm64 CHR's userspace is AArch32, armv7
+ *              soft-float)
  *
  * The chunks are replaced in place and the bytes of the instructions in
  * between are left alone.  The affected pages are made writable for the
@@ -207,14 +209,36 @@ static int replace_key(unsigned char *buf, size_t len,
 
 /*
  * The arm32 builds (the routeros arm64 CHR userspace is AArch32) materialise
- * the key differently: seven of the eight words sit in a .text literal pool
- * right after the verifier - in the order chunk 4, 5, 2, 0, 1, 6, 7 - and
- * the fourth word is computed as chunk2 + 0x1E4FD640 with three
- * `add rX, rX, #imm` instructions.  The pool words are patched in place and
- * the add sequence is rewritten to `movw rX, #lo(new3)` / `movt rX, #hi(new3)`
- * / nop, which does not depend on the old immediates and always encodes.
- * (Verified against 7.23.7 and 7.24.4 mode/keyman/loader.)
+ * the key with a literal pool plus an instruction sequence.  The full-word
+ * form stores seven of the eight words and derives the fourth from one of
+ * them; the pool order and the instruction block are compiler output and are
+ * not stable across RouterOS builds, so the words are matched as a set and the
+ * derived word is located by its arithmetic instead of a fixed instruction
+ * pattern.
  */
+
+#define ARM_WORDS      8
+#define ARM_SPAN_MAX   128	/* window holding one literal pool */
+#define ARM_CODE_BACK  512	/* instructions before the pool */
+#define ARM_CODE_FWD   256	/* instructions after the pool */
+#define ARM_MAX_INSNS  256
+#define ARM_MAX_PATCH  16
+
+struct arm_insn {
+	size_t off;
+	unsigned int word;
+};
+
+struct arm_step {
+	size_t off;
+	unsigned int imm;
+	int sub;
+};
+
+struct arm_patch {
+	size_t off;
+	unsigned int word;
+};
 
 static unsigned int arm_rd32(const unsigned char *p)
 {
@@ -230,66 +254,364 @@ static void arm_wr32(unsigned char *p, unsigned int v)
 	p[3] = (unsigned char)(v >> 24);
 }
 
-/* rewrite the instruction block that derives the fourth key word; site is the
- * offset of the literal pool, which must be the block's ldr target */
-static int patch_arm_key_site(unsigned char *buf, size_t len, size_t site,
-			      const unsigned char *newk)
+/* rotate the 8-bit immediate the way an ARM data-processing immediate does */
+static unsigned int arm_ror(unsigned int v, unsigned int shift)
 {
-	size_t j;
+	shift &= 31;
+	if (shift == 0)
+		return v;
+	return (v >> shift) | (v << (32 - shift));
+}
 
-	for (j = (site >= 256 ? site - 256 : 0); j + 28 <= site; j += 4) {
-		unsigned int w0 = arm_rd32(buf + j);
-		unsigned int w1 = arm_rd32(buf + j + 4);
-		unsigned int w2 = arm_rd32(buf + j + 8);
-		unsigned int w3 = arm_rd32(buf + j + 12);
-		unsigned int w4 = arm_rd32(buf + j + 16);
-		unsigned int w5 = arm_rd32(buf + j + 20);
-		unsigned int w6 = arm_rd32(buf + j + 24);
-		unsigned int r0, r2, r4, r6, t3, t5, word, lo, hi;
+/* ADD/SUB <reg>, <reg>, #imm, unconditional and without flags */
+static int arm_add_sub(unsigned int w, int *reg, unsigned int *imm, int *sub)
+{
+	unsigned int op;
 
-		if ((w0 & 0xfffff000u) != 0xe2833000u)	/* add rX, rX, #imm */
-			continue;
-		if (w1 != 0xe1cd00f0u)			/* strd r0, r1, [sp] */
-			continue;
-		if ((w2 & 0xfffff000u) != 0xe2833000u)
-			continue;
-		if ((w3 & 0xfffff000u) != 0xe59f0000u)	/* ldr r0, [pc, #imm] */
-			continue;
-		if ((w4 & 0xfffff000u) != 0xe2833000u)
-			continue;
-		if ((w5 & 0xfffff000u) != 0xe59f1000u)	/* ldr r1, [pc, #imm] */
-			continue;
-		if (w6 != 0xe58d300cu)			/* str rX, [sp, #0xc] */
-			continue;
-		r0 = (w0 >> 12) & 0xf;
-		r2 = (w2 >> 12) & 0xf;
-		r4 = (w4 >> 12) & 0xf;
-		r6 = (w6 >> 12) & 0xf;
-		if (r0 != r2 || r0 != r4 || r0 != r6)
-			continue;
-		if (((w0 >> 16) & 0xf) != r0 || ((w2 >> 16) & 0xf) != r0 ||
-		    ((w4 >> 16) & 0xf) != r0)		/* add: Rn == Rd */
-			continue;
-		t3 = (unsigned int)(j + 12 + 8) + (w3 & 0xfffu);
-		t5 = (unsigned int)(j + 20 + 8) + (w5 & 0xfffu);
-		if ((size_t)t3 != site + 0x14 || (size_t)t5 != site + 0x18)
-			continue;
+	if ((w >> 28) != 0xE || (w & 0x0E000000u) != 0x02000000u ||
+	    (w & (1u << 20)) != 0)
+		return 0;
+	op = (w >> 21) & 0xf;
+	if (op != 2 && op != 4)
+		return 0;
+	*reg = (int)((w >> 12) & 0xf);
+	if (((w >> 16) & 0xf) != (unsigned int)*reg)
+		return 0;
+	*imm = arm_ror(w & 0xff, 2 * ((w >> 8) & 0xf));
+	*sub = (op == 2);
+	return 1;
+}
 
-		/* the custom word as it should land in the 32-byte buffer */
-		word = (unsigned int)newk[12] | ((unsigned int)newk[13] << 8) |
-		       ((unsigned int)newk[14] << 16) |
-		       ((unsigned int)newk[15] << 24);
-		lo = word & 0xffffu;
-		hi = word >> 16;
-		arm_wr32(buf + j, 0xe3000000u | (((lo >> 12) & 0xfu) << 16) |
-			 (r0 << 12) | (lo & 0xfffu));		/* movw */
-		arm_wr32(buf + j + 8, 0xe3400000u | (((hi >> 12) & 0xfu) << 16) |
-			 (r0 << 12) | (hi & 0xfffu));		/* movt */
-		arm_wr32(buf + j + 16, 0xe1a00000u);		/* nop */
+static int arm_movw(unsigned int w, int *reg, unsigned int *imm)
+{
+	if ((w >> 28) != 0xE || (w & 0x0ff00000u) != 0x03000000u)
+		return 0;
+	*reg = (int)((w >> 12) & 0xf);
+	*imm = (((w >> 16) & 0xf) << 12) | (w & 0xfff);
+	return 1;
+}
+
+static int arm_movt(unsigned int w, int *reg, unsigned int *imm)
+{
+	if ((w >> 28) != 0xE || (w & 0x0ff00000u) != 0x03400000u)
+		return 0;
+	*reg = (int)((w >> 12) & 0xf);
+	*imm = (((w >> 16) & 0xf) << 12) | (w & 0xfff);
+	return 1;
+}
+
+/* LDR <reg>, [pc, #imm] */
+static int arm_ldr_literal(unsigned int w, size_t off, int *reg, size_t *target)
+{
+	int imm;
+	long t;
+
+	if ((w >> 28) != 0xE || (w & 0x0f7f0000u) != 0x051f0000u)
+		return 0;
+	imm = (int)(w & 0xfff);
+	if ((w & (1u << 23)) == 0)
+		imm = -imm;
+	t = (long)off + 8 + imm;
+	if (t < 0)
+		return 0;
+	*reg = (int)((w >> 12) & 0xf);
+	*target = (size_t)t;
+	return 1;
+}
+
+/* STR <reg>, [sp, #imm] */
+static int arm_str_sp(unsigned int w, int *reg)
+{
+	if ((w >> 28) != 0xE ||
+	    ((w & 0x0ff00000u) != 0x05800000u &&
+	     (w & 0x0ff00000u) != 0x05000000u))
+		return 0;
+	if (((w >> 16) & 0xf) != 13)
+		return 0;
+	*reg = (int)((w >> 12) & 0xf);
+	return 1;
+}
+
+static unsigned int arm_movw_word(int reg, unsigned int imm)
+{
+	return 0xE3000000u | ((imm >> 12) & 0xfu) << 16 |
+	       (unsigned int)reg << 12 | (imm & 0xfffu);
+}
+
+static unsigned int arm_movt_word(int reg, unsigned int imm)
+{
+	return 0xE3400000u | ((imm >> 12) & 0xfu) << 16 |
+	       (unsigned int)reg << 12 | (imm & 0xfffu);
+}
+
+/* find pat[0..patlen) in buf[lo..hi), returning its offset in at */
+static int arm_find_bytes(const unsigned char *buf, size_t len, size_t lo,
+			  size_t hi, const unsigned char *pat, size_t patlen,
+			  size_t *at)
+{
+	size_t p;
+
+	if (hi > len)
+		hi = len;
+	if (lo > hi || patlen > hi - lo)
+		return 0;
+	for (p = lo; p + patlen <= hi; p++) {
+		if (memcmp(buf + p, pat, patlen) == 0) {
+			*at = p;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* Find a window that holds all words in indices, in any order.  ends[] is
+ * indexed by key word and receives the offset of each word. */
+static int arm_find_table(const unsigned char *buf, size_t len,
+			  const unsigned char *oldk, const int *indices,
+			  int n, size_t *ends)
+{
+	const unsigned char *anchor = oldk + 4 * indices[0];
+	size_t pos = 0, at;
+
+	while (arm_find_bytes(buf, len, pos, len, anchor, 4, &at)) {
+		size_t lo = at > ARM_SPAN_MAX ? at - ARM_SPAN_MAX : 0;
+		size_t hi = at + ARM_SPAN_MAX + 4;
+		size_t first = at, last = at + 4;
+		int i, ok = 1;
+
+		ends[indices[0]] = at;
+		for (i = 1; i < n; i++) {
+			if (!arm_find_bytes(buf, len, lo, hi,
+					    oldk + 4 * indices[i], 4,
+					    &ends[indices[i]])) {
+				ok = 0;
+				break;
+			}
+			if (ends[indices[i]] < first)
+				first = ends[indices[i]];
+			if (ends[indices[i]] + 4 > last)
+				last = ends[indices[i]] + 4;
+		}
+		if (ok && last - first <= ARM_SPAN_MAX)
+			return 1;
+		pos = at + 1;
+	}
+	return 0;
+}
+
+/* The chain must start from a table word and the result must be written to
+ * the stack right after it; that ties the arithmetic to the key buffer. */
+static int arm_chain_matches(const struct arm_insn *insns, int n, int reg,
+			     size_t base_off, size_t chain_start,
+			     size_t chain_end)
+{
+	size_t store_off = (size_t)-1;
+	int i, loaded = 0;
+
+	for (i = 0; i < n; i++) {
+		int r;
+		size_t target;
+
+		if (insns[i].off >= chain_start ||
+		    chain_start - insns[i].off > 128)
+			continue;
+		if (arm_ldr_literal(insns[i].word, insns[i].off, &r, &target) &&
+		    r == reg && target == base_off)
+			loaded = 1;
+	}
+	if (!loaded)
+		return 0;
+
+	for (i = 0; i < n; i++) {
+		int r;
+
+		if (insns[i].off <= chain_end ||
+		    insns[i].off - chain_end > 64)
+			continue;
+		if (arm_str_sp(insns[i].word, &r) && r == reg) {
+			store_off = insns[i].off;
+			break;
+		}
+	}
+	if (store_off == (size_t)-1)
+		return 0;
+
+	for (i = 0; i < n; i++) {
+		int r, sub;
+		unsigned int imm;
+
+		if (insns[i].off <= chain_end || insns[i].off >= store_off)
+			continue;
+		if (arm_add_sub(insns[i].word, &r, &imm, &sub) && r == reg)
+			return 0;
+	}
+	return 1;
+}
+
+/* Find the instructions that compute the missing word and rewrite them to
+ * load newk's word directly.  Returns the number of patches, or 0. */
+static int arm_patch_derived(const unsigned char *buf, size_t len,
+			     const unsigned char *oldk, const unsigned char *newk,
+			     const size_t *word_offsets, int derived,
+			     struct arm_patch *patches, int max_patches)
+{
+	static struct arm_insn insns[ARM_MAX_INSNS];
+	static struct arm_step steps[ARM_MAX_INSNS];
+	unsigned int old_word = arm_rd32(oldk + 4 * derived);
+	unsigned int new_word = arm_rd32(newk + 4 * derived);
+	size_t min_off = len, max_off = 0, start, end;
+	int i, nins = 0;
+
+	for (i = 0; i < ARM_WORDS; i++) {
+		if (word_offsets[i] == (size_t)-1)
+			continue;
+		if (word_offsets[i] < min_off)
+			min_off = word_offsets[i];
+		if (word_offsets[i] + 4 > max_off)
+			max_off = word_offsets[i] + 4;
+	}
+	if (min_off == len)
+		return 0;
+
+	start = min_off > ARM_CODE_BACK ? min_off - ARM_CODE_BACK : 0;
+	start &= ~(size_t)3;
+	end = max_off + ARM_CODE_FWD;
+	if (end > len)
+		end = len;
+	for (; start + 4 <= end && nins < ARM_MAX_INSNS; start += 4) {
+		/* the literal pool is data, not instructions */
+		if (start >= min_off && start < max_off)
+			continue;
+		insns[nins].off = start;
+		insns[nins].word = arm_rd32(buf + start);
+		nins++;
+	}
+
+	/* MOVW/MOVT pair */
+	for (i = 0; i + 1 < nins; i++) {
+		int r1, r2;
+		unsigned int lo, hi;
+
+		if (!arm_movw(insns[i].word, &r1, &lo) ||
+		    lo != (old_word & 0xffff))
+			continue;
+		if (!arm_movt(insns[i + 1].word, &r2, &hi) ||
+		    r2 != r1 || hi != (old_word >> 16))
+			continue;
+		if (max_patches < 2)
+			return 0;
+		patches[0].off = insns[i].off;
+		patches[0].word = arm_movw_word(r1, new_word & 0xffff);
+		patches[1].off = insns[i + 1].off;
+		patches[1].word = arm_movt_word(r1, new_word >> 16);
+		return 2;
+	}
+
+	for (i = 0; i < 16; i++) {
+		int reg = i, nsteps = 0, a, b;
+
+		for (b = 0; b < nins; b++) {
+			int r, sub;
+			unsigned int imm;
+
+			if (!arm_add_sub(insns[b].word, &r, &imm, &sub) ||
+			    r != reg)
+				continue;
+			if (nsteps >= ARM_MAX_INSNS)
+				break;
+			steps[nsteps].off = insns[b].off;
+			steps[nsteps].imm = imm;
+			steps[nsteps].sub = sub;
+			nsteps++;
+		}
+		for (a = 0; a + 1 < nsteps; a++) {
+			unsigned int delta = 0;
+			int j;
+
+			for (j = a; j < nsteps && j < a + 4; j++) {
+				if (steps[j].sub)
+					delta -= steps[j].imm;
+				else
+					delta += steps[j].imm;
+				if (j == a)
+					continue;
+				for (b = 0; b < ARM_WORDS; b++) {
+					int np = j - a + 1, k;
+
+					if (word_offsets[b] == (size_t)-1)
+						continue;
+					if (arm_rd32(oldk + 4 * b) + delta != old_word)
+						continue;
+					if (!arm_chain_matches(insns, nins, reg,
+							       word_offsets[b],
+							       steps[a].off,
+							       steps[j].off))
+						continue;
+					if (np > max_patches)
+						return 0;
+					patches[0].off = steps[a].off;
+					patches[0].word = arm_movw_word(reg,
+								       new_word & 0xffff);
+					patches[1].off = steps[a + 1].off;
+					patches[1].word = arm_movt_word(reg,
+								       new_word >> 16);
+					for (k = a + 2; k <= j; k++) {
+						patches[k - a].off = steps[k].off;
+						patches[k - a].word = 0xE1A00000u;
+					}
+					return np;
+				}
+			}
+		}
+	}
+	return 0;
+}
+
+/* Patch one table; *next is the offset just past the last patched byte. */
+static int arm_patch_table(unsigned char *buf, size_t len,
+			   const unsigned char *oldk, const unsigned char *newk,
+			   size_t *next)
+{
+	static const int all[ARM_WORDS] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+	static const int stored[7] = { 4, 5, 2, 0, 1, 6, 7 };
+	struct arm_patch patches[ARM_MAX_PATCH];
+	size_t ends[ARM_WORDS], last = 0;
+	int i, np;
+
+	for (i = 0; i < ARM_WORDS; i++)
+		ends[i] = (size_t)-1;
+	if (arm_find_table(buf, len, oldk, all, ARM_WORDS, ends)) {
+		for (i = 0; i < ARM_WORDS; i++) {
+			arm_wr32(buf + ends[i], arm_rd32(newk + 4 * i));
+			if (ends[i] + 4 > last)
+				last = ends[i] + 4;
+		}
+		*next = last;
 		return 1;
 	}
-	(void)len;
-	return 0;
+
+	for (i = 0; i < ARM_WORDS; i++)
+		ends[i] = (size_t)-1;
+	if (!arm_find_table(buf, len, oldk, stored, 7, ends))
+		return 0;
+	np = arm_patch_derived(buf, len, oldk, newk, ends, 3,
+			       patches, ARM_MAX_PATCH);
+	if (np <= 0)
+		return 0;
+	for (i = 0; i < 7; i++) {
+		int idx = stored[i];
+
+		arm_wr32(buf + ends[idx], arm_rd32(newk + 4 * idx));
+		if (ends[idx] + 4 > last)
+			last = ends[idx] + 4;
+	}
+	for (i = 0; i < np; i++) {
+		arm_wr32(buf + patches[i].off, patches[i].word);
+		if (patches[i].off + 4 > last)
+			last = patches[i].off + 4;
+	}
+	*next = last;
+	return 1;
 }
 
 /* Replace every arm32-style copy of oldk in buf with newk.  Returns the number
@@ -297,21 +619,18 @@ static int patch_arm_key_site(unsigned char *buf, size_t len, size_t site,
 static int replace_key(unsigned char *buf, size_t len,
 		       const unsigned char *oldk, const unsigned char *newk)
 {
-	static const int order[7] = { 4, 5, 2, 0, 1, 6, 7 };
-	unsigned char pat[28];
-	size_t i;
-	int c, hits = 0;
+	size_t off = 0;
+	int hits = 0;
 
-	for (c = 0; c < 7; c++)
-		memcpy(pat + 4 * c, oldk + 4 * order[c], 4);
-	for (i = 0; i + sizeof(pat) <= len; i++) {
-		if (memcmp(buf + i, pat, sizeof(pat)) != 0)
-			continue;
-		if (!patch_arm_key_site(buf, len, i, newk))
-			continue;
-		for (c = 0; c < 7; c++)
-			memcpy(buf + i + 4 * c, newk + 4 * order[c], 4);
+	while (off + 4 <= len) {
+		size_t next = 0;
+
+		if (!arm_patch_table(buf + off, len - off, oldk, newk, &next))
+			break;
+		if (next == 0)
+			break;
 		hits++;
+		off += next;
 	}
 	return hits;
 }

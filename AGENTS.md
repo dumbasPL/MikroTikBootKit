@@ -96,7 +96,8 @@ Boot-time tooling for MikroTik RouterOS images.  Two pieces:
   tracer is built as an arm32 static musl binary and the probe as an armv7
   soft-float shared object (`.toolchain/arm-musl`, `tools/musl_arm.sh`); the
   licence key is materialised differently there (a `.text` literal pool plus
-  an arithmetic word, see `docs/ptrace-init-preload.md`).
+  a compiler-derived word; the pool order and the arithmetic are matched, not
+  assumed - see `docs/ptrace-init-preload.md`).
 
 Design notes, the target behaviours it relies on and the observed boot log:
 `docs/ptrace-init-preload.md`.
@@ -489,7 +490,10 @@ when the stored one no longer verifies).
   `docs/ptrace-init-preload.md`).  On 7.25 the x86 compiler scheduled the
   eight key-load immediates differently (chunks 5 and 6 swapped), so the
   probe matches them as an unordered set in a small window instead of
-  requiring key order.  On 7.24.4 the kernel refuses
+  requiring key order.  The arm32 pool words are matched as a set too, and
+  the derived word is located by its arithmetic rather than a fixed
+  instruction block, so compiler scheduling changes there do not break the
+  patch.  On 7.24.4 the kernel refuses
   `PROT_EXEC` mappings of tmpfs files, so the probe is not written to `/ram`
   but bind-mounted there from a copy kept on the initramfs; the same kernel
   also rejects `mprotect(PROT_READ|PROT_WRITE|PROT_EXEC)`, so the in-memory

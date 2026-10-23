@@ -404,8 +404,8 @@ image; the changes live in those processes and in the 512-byte licence blob.
   on-stack key is the same - so the probe matches the eight chunks as a set
   inside a 256-byte window and rewrites each at its own offset, leaving the
   instruction bytes alone.  Only the private (COW) mapping is written.
-  On **arm32** (see below) the same scan works on the pool words, and the
-  derived word is patched by rewriting the add sequence.
+  On **arm32** (see below) the same set matching works on the pool words, and
+  the arithmetic that derives the missing word is located and rewritten.
 * **`/nova/bin/loader`** - its `memcmp` GOT slot is redirected to a stub that
   always returns 0.  The loader's licence verifier ends in
   `memcmp(MT_SHA256(y.x), witness, 16) == 0`, so the redirect makes it accept
@@ -489,23 +489,30 @@ the probe is an armv7 soft-float shared object (`-mfloat-abi=soft
 
 The licence key material is encoded differently in the arm32 builds.  The
 verifier (the same function in `mode`, `keyman` and `loader`) builds the
-32-byte key on the stack from a **literal pool of seven words** in `.text`
-(in the order chunk 4, 5, 2, 0, 1, 6, 7) and materialises the fourth word
-with three `add rX, rX, #imm` instructions (chunk2 + `0x1E4FD640`).  The x86
-chunk scan finds only seven of the eight words, so the arm32 patcher:
+32-byte key on the stack from a **literal pool** in `.text` plus an
+instruction sequence that derives the missing word.  The pool order and the
+instructions are compiler output: 7.23.7/7.24.4/7.25 store seven words in the
+order chunk 4, 5, 2, 0, 1, 6, 7 and derive the fourth with three
+`add rX, rX, #imm` instructions (chunk2 + `0x1E4FD640`), but a later build may
+schedule or encode both differently.  The arm32 patcher therefore:
 
-1. finds the 28-byte pool pattern in the executable mapping,
-2. locates the surrounding 7-instruction block
-   (`add; strd r0,r1,[sp]; add; ldr r0,[pc]->pool+0x14; add;
-   ldr r1,[pc]->pool+0x18; str rX,[sp,#0xc]`) and verifies the two `ldr`
-   targets point into the pool (that ties the block to the pattern),
-3. rewrites the first add to `movw rX, #lo16(new word)`, the second to
-   `movt rX, #hi16(new word)` and the third to a nop, and
-4. patches the seven pool words in place.
+1. finds the seven stored words as a **set** in a small window, in any order
+   (if all eight words are present, it patches them directly);
+2. locates the derived word by its arithmetic: a chain of `ADD`/`SUB`
+   immediates on one register starting from one of the pool words, or a
+   `MOVW`/`MOVT` pair.  It verifies that the chain's register is loaded from
+   the pool word before it and stored to the stack after it, which ties the
+   arithmetic to the key buffer;
+3. rewrites the first two instructions to `movw rX, #lo16(new word)` /
+   `movt rX, #hi16(new word)` and any remaining chain steps to nops; and
+4. patches the pool words in place.
 
-This was verified on the 7.23.7 and 7.24.4 `mode`/`keyman` (and the identical
-block in `loader`) before it was written in C; it does not depend on the old
-immediates, so any custom key works.
+The table is only written when the derived-word rewrite was also found, so a
+changed instruction sequence cannot leave a half-patched key behind.
+
+This was verified on the 7.23.7, 7.24.4 and 7.25 `mode`/`keyman` (and the
+identical block in `loader`); it does not depend on the old immediates or the
+stock pool order, so any custom key works.
 
 The `memcmp` GOT redirect needs no changes: the arm32 `loader` uses ELF32
 `R_ARM_JUMP_SLOT` relocations in `.rel.plt` (`DT_REL`/`DT_JMPREL`), exactly

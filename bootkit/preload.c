@@ -33,7 +33,9 @@
  * reference patch does to the binaries.  The encoding differs per arch:
  *
  *   x86        the 32-byte public key is eight `mov dword [ebp-x], imm32`
- *              immediates in .text (up to 6 bytes between the 4-byte chunks)
+ *              immediates in .text; the compiler may emit them in any order
+ *              (7.25 swaps chunks 5 and 6), so the eight chunks are matched
+ *              as a set inside a small window
  *   arm32      seven words sit in a .text literal pool (order 4,5,2,0,1,6,7)
  *              and the fourth is computed from the third with three `add`
  *              immediates; the pool and the add sequence are rewritten (the
@@ -95,9 +97,10 @@ static int verbose_log(void)
 	"8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32"
 #endif
 
-/* up to this many bytes may sit between two 4-byte key chunks */
-#define KEY_GAP_MAX 6
-#define KEY_CHUNKS  8
+/* the eight key chunks must all sit inside this window; x86 compilers put the
+ * immediate loads back to back, even when they schedule them out of order */
+#define KEY_SPAN_MAX 256
+#define KEY_CHUNKS   8
 
 /* ----------------------------------------------------------------- logging */
 
@@ -126,31 +129,45 @@ static void console_log(const char *fmt, ...)
 
 #if !defined(__arm__)
 
-/* Match chunks idx..7 of oldk in buf at offsets >= after, with at most
- * KEY_GAP_MAX bytes between consecutive chunks (the same greedy search the
- * reference key patcher uses).  ends[] receives the offset of each chunk;
- * returns the end offset of the last chunk, or 0 when there is no match. */
-static size_t match_key(const unsigned char *buf, size_t len, size_t after,
-			int idx, const unsigned char *oldk, size_t *ends)
+/* Find all eight chunks of oldk in the window around the chunk0 occurrence at
+ * anchor.  ends[] is indexed by chunk number and receives each chunk's offset.
+ *
+ * The x86 verifier loads the key with eight independent mov-immediate
+ * instructions.  The compiler may schedule those in any order: 7.25 emits
+ * chunks 5 and 6 swapped, so the ordered greedy search used to miss the key
+ * even though the resulting on-stack key is identical.  Look for every chunk
+ * at its own offset inside a small window instead.
+ *
+ * Returns 1 when the complete key was found, 0 otherwise. */
+static int match_key(const unsigned char *buf, size_t len, size_t anchor,
+		     const unsigned char *oldk, size_t *ends)
 {
-	int gap;
+	int seen[KEY_CHUNKS] = { 0 };
+	size_t lo, hi, p, first, last;
+	int n = 0, k;
 
-	if (idx == KEY_CHUNKS)
-		return ends[KEY_CHUNKS - 1] + 4;
-	if (after + 4 > len)
-		return 0;
-	for (gap = KEY_GAP_MAX; gap >= 0; gap--) {
-		size_t p = after + (size_t)gap;
-
-		if (p + 4 > len)
-			continue;
-		if (memcmp(buf + p, oldk + 4 * idx, 4) != 0)
-			continue;
-		ends[idx] = p;
-		if (match_key(buf, len, p + 4, idx + 1, oldk, ends) != 0)
-			return ends[KEY_CHUNKS - 1] + 4;
+	lo = anchor > KEY_SPAN_MAX ? anchor - KEY_SPAN_MAX : 0;
+	hi = anchor + KEY_SPAN_MAX + 4;
+	if (hi > len)
+		hi = len;
+	first = anchor;
+	last = anchor + 4;
+	for (p = lo; p + 4 <= hi; p++) {
+		for (k = 0; k < KEY_CHUNKS; k++) {
+			if (seen[k] || memcmp(buf + p, oldk + 4 * k, 4) != 0)
+				continue;
+			seen[k] = 1;
+			ends[k] = p;
+			if (p < first)
+				first = p;
+			if (p + 4 > last)
+				last = p + 4;
+			n++;
+			p += 3;
+			break;
+		}
 	}
-	return 0;
+	return n == KEY_CHUNKS && last - first <= KEY_SPAN_MAX;
 }
 
 /* Replace every chunked copy of oldk in buf with newk.  Returns the number of
@@ -170,14 +187,16 @@ static int replace_key(unsigned char *buf, size_t len,
 			i++;
 			continue;
 		}
-		ends[0] = i;
-		end = match_key(buf, len, i + 4, 1, oldk, ends);
-		if (end == 0) {
+		if (!match_key(buf, len, i, oldk, ends)) {
 			i++;
 			continue;
 		}
-		for (c = 0; c < KEY_CHUNKS; c++)
+		end = i + 4;
+		for (c = 0; c < KEY_CHUNKS; c++) {
 			memcpy(buf + ends[c], newk + 4 * c, 4);
+			if (ends[c] + 4 > end)
+				end = ends[c] + 4;
+		}
 		hits++;
 		i = end;
 	}

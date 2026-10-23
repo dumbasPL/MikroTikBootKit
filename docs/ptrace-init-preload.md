@@ -103,7 +103,7 @@ licence (keygen, public key, memcmp GOT), see
 * **32-bit tracer.**  Built as a static i386 binary (musl) to match RouterOS
   userspace, so `PTRACE_PEEKDATA` uses 4-byte words and 32-bit addresses.
 
-## Verified on 7.23.7 and 7.24.4 (CHR-mode x86 install, QEMU/KVM)
+## Verified on 7.23.7, 7.24.4 and 7.25 (CHR-mode x86 install, QEMU/KVM)
 
 Serial log of a boot with `rdinit=/ptrace_init` (current build):
 
@@ -125,8 +125,11 @@ Serial log of a boot with `rdinit=/ptrace_init` (current build):
 ... 42-47 loads in total; the boot reaches "CHR Login:" normally
 ```
 
-The same build reaches the login prompt with 42-45 loads on 7.24.4.  The
-older build, which wrote the probe bytes to `/ram`, logged
+The same build reaches the login prompt with 42-45 loads on 7.24.4 and 42 on
+7.25 (mode and keyman each report `licence key patched (1 site)`; CHR shows
+`level: p-unlimited`, x86 mode `nlevel: 6` with no `expires-in`).  The 7.25
+arm64 CHR also boots (34 loads, `level: p-unlimited`).  The older
+build, which wrote the probe bytes to `/ram`, logged
 `dropped /ram/ldpreload.so (13636 bytes), detaching` instead; it does not
 load on 7.24.4, which is why the bind-mount route replaced it.
 
@@ -395,11 +398,11 @@ image; the changes live in those processes and in the 512-byte licence blob.
   is replaced in the process's own text.  On i386 the key is not stored as a
   byte string: the verifier builds it on the stack with eight
   `mov dword [ebp-x], imm32` instructions, so the 4-byte key chunks sit in
-  `.text` with up to 6 opcode bytes between them (`7.23.7 mode` at file
-  offset `0x5e23`, `keyman` at `0x765e`; the 7.24.4 binaries are identical).
-  The probe scans the executable's `r-xp` mapping from `/proc/self/maps`,
-  matches the chunks with the same greedy gap search as the reference key
-  patcher and rewrites the chunks in place, leaving the
+  `.text` (`7.23.7 mode` at file offset `0x5e23`, `keyman` at `0x765e`;
+  7.24.4 is identical).  The compiler may schedule those independent loads in
+  any order - 7.25 emits chunks 5 and 6 swapped even though the resulting
+  on-stack key is the same - so the probe matches the eight chunks as a set
+  inside a 256-byte window and rewrites each at its own offset, leaving the
   instruction bytes alone.  Only the private (COW) mapping is written.
   On **arm32** (see below) the same scan works on the pool words, and the
   derived word is patched by rewriting the add sequence.

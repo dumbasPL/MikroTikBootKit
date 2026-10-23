@@ -481,12 +481,15 @@ when the stored one no longer verifies).
 
 ### Notes / gotchas
 
-* **Known versions:** works on 7.23.7 and 7.24.4 (both x86 and CHR mode,
-  40-47 loads, boot reaches the login prompt).  The arm64 CHR of those
+* **Known versions:** works on 7.23.7, 7.24.4 and 7.25 (both x86 and CHR
+  mode, 40-47 loads, boot reaches the login prompt).  The arm64 CHR of those
   versions is covered too: its userspace is AArch32, so the same probe is
   built as armv7 soft-float and the licence key is patched in its own
   encoding (a `.text` literal pool plus an arithmetic word; see
-  `docs/ptrace-init-preload.md`).  On 7.24.4 the kernel refuses
+  `docs/ptrace-init-preload.md`).  On 7.25 the x86 compiler scheduled the
+  eight key-load immediates differently (chunks 5 and 6 swapped), so the
+  probe matches them as an unordered set in a small window instead of
+  requiring key order.  On 7.24.4 the kernel refuses
   `PROT_EXEC` mappings of tmpfs files, so the probe is not written to `/ram`
   but bind-mounted there from a copy kept on the initramfs; the same kernel
   also rejects `mprotect(PROT_READ|PROT_WRITE|PROT_EXEC)`, so the in-memory
@@ -499,8 +502,8 @@ when the stored one no longer verifies).
   the trick the recovered reference tool uses - so its licence verifier
   accepts the custom signature.  GOT only; no text or key bytes are changed.
 * **The licence works on CHR and x86.**  CHR binds to the VM UUID plus the
-  software id; x86 mode (7.23.7 and 7.24.4) binds to the hardware-derived
-  software id.  Without the loader hook x86 reports
+  software id; x86 mode (7.23.7, 7.24.4 and 7.25) binds to the
+  hardware-derived software id.  Without the loader hook x86 reports
   `nlevel: 6` / `features: extra-channels` but keeps a rolling ~72 h
   `expires-in`; with the hook the loader also accepts the signature, the
   countdown is gone and the demo counter stays at 0.  Details:

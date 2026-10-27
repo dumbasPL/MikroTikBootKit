@@ -525,15 +525,22 @@ cmd_boot_removable() {
     log "== qemu started (removable, pid $(cat "$PIDFILE"))"
 }
 
-# is the process still running?  kill -0 also succeeds for a zombie: it has
-# exited and dropped every lock, it only waits to be reaped
+# is the QEMU we started still running?  Two traps here:
+#  - a zombie still answers kill -0, yet it has already exited and holds no
+#    locks, it only waits to be reaped;
+#  - once qemu is gone its pid can be reused by an unrelated process, so
+#    "the pid exists" is not evidence of anything (and SIGKILLing that
+#    stranger would be far worse than failing the run).
+# So require the pid to still name a qemu: /proc/<pid>/cmdline holds the
+# process' own argv and reads back empty for a zombie.  The process can vanish
+# between the open and the read, so the whole read is silenced - that race is
+# ordinary and means "gone", not an error.
 qemu_alive() {
-    local pid=$1 stat
-    kill -0 "$pid" 2>/dev/null || return 1
-    stat=$(ps -o stat= -p "$pid" 2>/dev/null) || return 0
-    case "$stat" in
-        ""|Z*) return 1 ;;
-        *)     return 0 ;;
+    local pid=$1 cmd
+    cmd=$( { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null ) || return 1
+    case "$cmd" in
+        *qemu-system-*) return 0 ;;
+        *)              return 1 ;;
     esac
 }
 
@@ -591,7 +598,10 @@ wait_images_free() {
 # mtools).  SIGTERM is normally instant, but right after the guest asked for a
 # cold reset (the installer's last act) QEMU can take seconds to exit, and it
 # unlinks its pidfile before it exits, so the pid alone cannot be trusted:
-# escalate to SIGKILL and, as a last resort, wait for the image locks.
+# escalate to SIGKILL and then wait for the image locks, which are what the
+# next start actually contends for.  A pid that outlives even SIGKILL is only
+# warned about - progress is gated on the locks, not on the pid - so a
+# liveness blip can never fail an otherwise fine run.
 stop_qemu() {
     local pid
     pid=$(cat "$PIDFILE" 2>/dev/null || true)
@@ -609,7 +619,8 @@ stop_qemu() {
                 sleep 0.1
             done
         fi
-        qemu_alive "$pid" && die "qemu $pid is still running"
+        qemu_alive "$pid" &&
+            log "== warning: qemu $pid is still running (check it by hand)"
     fi
     rm -f "$PIDFILE"
     if ! wait_images_free; then

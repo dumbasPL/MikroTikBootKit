@@ -367,7 +367,7 @@ cmd_iso_install() {
     : > "$SERIAL_LOG"
     rm -f "$SERIAL_SOCK"
     # shellcheck disable=SC2046
-    $(qemu_cmd_iso "$out") -daemonize -pidfile "$PIDFILE"
+    start_qemu $(qemu_cmd_iso "$out")
 
     if ! python3 "$ROOT/vmconsole.py" "$SERIAL_SOCK" --ros-install; then
         stop_qemu
@@ -386,7 +386,7 @@ cmd_iso_install() {
     : > "$SERIAL_LOG"
     rm -f "$SERIAL_SOCK"
     # shellcheck disable=SC2046
-    $(qemu_cmd_stock "$out") -daemonize -pidfile "$PIDFILE"
+    start_qemu $(qemu_cmd_stock "$out")
     if ! python3 "$ROOT/vmconsole.py" "$SERIAL_SOCK" --ros-firstboot; then
         stop_qemu
         rm -f "$out"
@@ -437,6 +437,8 @@ cmd_prepare() {
     (make -C "$ROOT" DEBUG="$DEBUG" "$build_arch")
 
     mkdir -p "$WORK"
+    # the image is about to be rewritten: nothing may still have it open
+    stop_qemu
     log "== copying image ($IMG_SRC -> $IMG)"
     rm -f "$IMG.sha" 2>/dev/null || true
     cp -f "$IMG_SRC" "$IMG"
@@ -481,7 +483,7 @@ cmd_install() {
     : > "$SERIAL_LOG"
     rm -f "$SERIAL_SOCK"
     # shellcheck disable=SC2046
-    $(qemu_cmd_install) -daemonize -pidfile "$PIDFILE"
+    start_qemu $(qemu_cmd_install)
 
     if ! python3 "$ROOT/vmconsole.py" "$SERIAL_SOCK" --install "${INSTALL_MODE:-1}"; then
         log "== installer failed, restoring the kernel"
@@ -506,7 +508,7 @@ cmd_boot() {
     : > "$SERIAL_LOG"
     rm -f "$SERIAL_SOCK"
     # shellcheck disable=SC2046
-    $(qemu_cmd) -daemonize -pidfile "$PIDFILE"
+    start_qemu $(qemu_cmd)
     log "== qemu started (pid $(cat "$PIDFILE"))"
 }
 
@@ -519,19 +521,125 @@ cmd_boot_removable() {
     : > "$SERIAL_LOG"
     rm -f "$SERIAL_SOCK"
     # shellcheck disable=SC2046
-    $(qemu_cmd_removable) -daemonize -pidfile "$PIDFILE"
+    start_qemu $(qemu_cmd_removable)
     log "== qemu started (removable, pid $(cat "$PIDFILE"))"
 }
 
+# is the process still running?  kill -0 also succeeds for a zombie: it has
+# exited and dropped every lock, it only waits to be reaped
+qemu_alive() {
+    local pid=$1 stat
+    kill -0 "$pid" 2>/dev/null || return 1
+    stat=$(ps -o stat= -p "$pid" 2>/dev/null) || return 0
+    case "$stat" in
+        ""|Z*) return 1 ;;
+        *)     return 0 ;;
+    esac
+}
+
+# 0 when some process holds the write lock QEMU takes on an image, 1 when it
+# is free.  The lock is what makes the next start fail ("Failed to get write
+# lock"), so this is the state the harness actually has to wait for - the pid
+# is not reliable: QEMU drops its pidfile before it closes the disks.
+image_locked() {
+    python3 - "$1" <<'PY'
+import fcntl, os, sys
+try:
+    fd = os.open(sys.argv[1], os.O_RDWR)
+except OSError:
+    sys.exit(1)                  # gone or not writable: nothing locks it
+try:
+    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fcntl.lockf(fd, fcntl.LOCK_UN)
+    sys.exit(1)
+except OSError:
+    sys.exit(0)
+PY
+}
+
+# the disk image files a QEMU command line opens (the arguments of the form
+# if=...,file=<path>,... - the pflash varstore is one of them, QEMU locks it
+# for writing as well)
+qemu_images() {
+    local a
+    for a in "$@"; do
+        case "$a" in
+            if=*",file="*) printf '%s\n' "$a" | sed -e 's/.*,file=//' -e 's/,.*//' ;;
+        esac
+    done
+}
+
+# wait for the images of the last started instance to become lockable again;
+# 0 when they are, 1 on timeout (seconds, default 10)
+wait_images_free() {
+    local timeout=${1:-10} deadline f
+    deadline=$(( $(date +%s) + timeout ))
+    while :; do
+        for f in $(cat "$WORK/qemu.images" 2>/dev/null); do
+            if [ -f "$f" ] && image_locked "$f"; then
+                [ "$(date +%s)" -lt "$deadline" ] || return 1
+                sleep 0.1
+                continue 2
+            fi
+        done
+        return 0
+    done
+}
+
+# Stop the instance in $PIDFILE and wait until it has really let go of the
+# images before the caller starts the next one (or edits the image with
+# mtools).  SIGTERM is normally instant, but right after the guest asked for a
+# cold reset (the installer's last act) QEMU can take seconds to exit, and it
+# unlinks its pidfile before it exits, so the pid alone cannot be trusted:
+# escalate to SIGKILL and, as a last resort, wait for the image locks.
 stop_qemu() {
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-        kill "$(cat "$PIDFILE")"
-        for _ in $(seq 1 30); do
-            kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null || break
+    local pid
+    pid=$(cat "$PIDFILE" 2>/dev/null || true)
+    if [ -n "$pid" ] && qemu_alive "$pid"; then
+        kill "$pid" 2>/dev/null || true
+        for _ in $(seq 1 50); do
+            qemu_alive "$pid" || break
             sleep 0.1
         done
+        if qemu_alive "$pid"; then
+            log "== qemu $pid did not exit on SIGTERM, killing it"
+            kill -9 "$pid" 2>/dev/null || true
+            for _ in $(seq 1 50); do
+                qemu_alive "$pid" || break
+                sleep 0.1
+            done
+        fi
+        qemu_alive "$pid" && die "qemu $pid is still running"
     fi
     rm -f "$PIDFILE"
+    if ! wait_images_free; then
+        log "== warning: the images are still locked after stopping qemu"
+    fi
+    rm -f "$WORK/qemu.images"
+}
+
+# Start QEMU daemonized with $PIDFILE.  The write lock the previous instance
+# held is released slightly after it goes away, so a start that trips over it
+# is retried instead of failing the whole run.
+start_qemu() {
+    local err=$WORK/qemu-start.err i
+    mkdir -p "$WORK"
+    for i in $(seq 1 20); do
+        if "$@" -daemonize -pidfile "$PIDFILE" 2>"$err"; then
+            qemu_images "$@" > "$WORK/qemu.images"
+            rm -f "$err"
+            return 0
+        fi
+        if grep -q 'Failed to get "write" lock' "$err" 2>/dev/null; then
+            log "== the image is still locked, retrying qemu start ($i)"
+            wait_images_free || sleep 1
+            continue
+        fi
+        break
+    done
+    cat "$err" >&2
+    rm -f "$err"
+    die "cannot start qemu"
 }
 
 cmd_stop() { stop_qemu; log "== stopped"; }
@@ -605,7 +713,7 @@ cmd_boot_auto() {
     : > "$SERIAL_LOG"
     rm -f "$SERIAL_SOCK"
     # shellcheck disable=SC2046
-    $(qemu_cmd_removable) -daemonize -pidfile "$PIDFILE"
+    start_qemu $(qemu_cmd_removable)
     log "== qemu started (auto stick, pid $(cat "$PIDFILE"))"
 }
 
